@@ -1,0 +1,39 @@
+# Langfuse 自托管（可观测 Trace + 评测）。
+# 诚实标注：Langfuse 自托管依赖 ClickHouse + Postgres，环境变量较多，
+# 以下为「最小可起」版本，生产请以官方自托管文档为准（https://langfuse.com/self-hosting）。
+# 用法：docker compose -f infra/langfuse.yml up -d
+services:
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: guardeye-langfuse
+    ports:
+      - "3000:3000"
+    environment:
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: change-me-secret
+      SALT: change-me-salt
+      DATABASE_URL: postgresql://langfuse:langfuse@postgres:5432/langfuse
+      CLICKHOUSE_URL: http://clickhouse:8123
+    depends_on:
+      - postgres
+      - clickhouse
+
+  postgres:
+    image: postgres:15
+    container_name: guardeye-langfuse-postgres
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-pg:/var/lib/postgresql/data
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: guardeye-langfuse-clickhouse
+    volumes:
+      - langfuse-ch:/var/lib/clickhouse
+
+volumes:
+  langfuse-pg:
+  langfuse-ch:

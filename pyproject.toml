@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "guard-eye-agent"
+version = "0.1.0"
+description = "多模态自主巡检 Agent：基于 LangGraph + MCP 的工地/园区安全巡检系统"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "LYK" }]
+
+# 依赖版本下限保守、均真实存在；生产环境可自由升级。
+# 设计意图：核心逻辑不绑定任何特定小版本，接口层（llm/vector_store/mcp）屏蔽了版本差异。
+dependencies = [
+    # Agent 编排核心
+    "langgraph>=0.2.0",
+    # 数据模型与校验
+    "pydantic>=2.0.0",
+    # 向量库客户端（memory 后端不依赖，qdrant 后端需要）
+    "qdrant-client>=1.9.0",
+    # 视频处理（抽帧 / 运动检测）
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "pillow>=10.0.0",
+    # LLM API 调用与配置加载
+    "httpx>=0.25.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+# 前端复核台（可选，Phase 5/7）
+frontend = [
+    "streamlit>=1.30.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["agents*", "mcp_servers*", "eval*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

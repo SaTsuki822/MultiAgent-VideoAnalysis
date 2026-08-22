@@ -1,0 +1,49 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ---- 环境与密钥 ----
+.env
+.env.local
+*.pem
+
+# ---- 数据 / 模型 / 运行时产物 ----
+data/
+dataset/raw/
+*.mp4
+*.avi
+*.mov
+*.pt
+*.safetensors
+*.gguf
+checkpoints/
+*.sqlite
+*.sqlite3
+langfuse-data/
+qdrant-data/
+
+# ---- IDE / 系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# ---- 评测输出 ----
+eval/output/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- Claude Code / 本地工具配置 ----
+.claude/
+
+# ---- 求职准备 / 开发过程文档（不对外公开）----
+CLAUDE.md
+plan/

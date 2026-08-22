@@ -1,0 +1,128 @@
+# GuardEye 一键起基础设施（Qdrant 必选，Langfuse 可选，Redis 多 Agent 必选）。
+# 用法：docker compose up -d qdrant redis
+# 完整：docker compose up -d（含 Langfuse，需按 infra/langfuse.yml 说明核对环境变量）
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: guardeye-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+  # Redis：多 Agent 通信基础设施（必选）
+  redis:
+    image: redis:7-alpine
+    container_name: guardeye-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  # 多 Agent 服务（可选，Phase 8 启用）
+  planner-agent:
+    build:
+      context: .
+      dockerfile: multi_agent/planner_agent/Dockerfile
+    container_name: guardeye-planner
+    ports:
+      - "8001:8000"
+    environment:
+      - GUARDEYE_LLM_BACKEND=${GUARDEYE_LLM_BACKEND:-mock}
+    depends_on:
+      - qdrant
+    profiles: ["multi-agent"]
+
+  perception-agent-1:
+    build:
+      context: .
+      dockerfile: multi_agent/perception_agent/Dockerfile
+    container_name: guardeye-perception-1
+    environment:
+      - AGENT_ID=perception-1
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+      - qdrant
+    profiles: ["multi-agent"]
+
+  perception-agent-2:
+    build:
+      context: .
+      dockerfile: multi_agent/perception_agent/Dockerfile
+    container_name: guardeye-perception-2
+    environment:
+      - AGENT_ID=perception-2
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+      - qdrant
+    profiles: ["multi-agent"]
+
+  decision-agent:
+    build:
+      context: .
+      dockerfile: multi_agent/decision_agent/Dockerfile
+    container_name: guardeye-decision
+    ports:
+      - "8003:8000"
+    environment:
+      - GUARDEYE_LLM_BACKEND=${GUARDEYE_LLM_BACKEND:-mock}
+      - GUARDEYE_VECTOR_BACKEND=${GUARDEYE_VECTOR_BACKEND:-memory}
+    depends_on:
+      - qdrant
+    profiles: ["multi-agent"]
+
+  action-agent:
+    build:
+      context: .
+      dockerfile: multi_agent/action_agent/Dockerfile
+    container_name: guardeye-action
+    ports:
+      - "8004:8000"
+    environment:
+      - GUARDEYE_LLM_BACKEND=${GUARDEYE_LLM_BACKEND:-mock}
+    depends_on:
+      - qdrant
+    profiles: ["multi-agent"]
+
+  # Langfuse 自托管（可选，可观测）。依赖 postgres 与 clickhouse，见 infra/langfuse.yml。
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: guardeye-langfuse
+    ports:
+      - "3000:3000"
+    environment:
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: change-me-secret
+      SALT: change-me-salt
+      DATABASE_URL: postgresql://langfuse:langfuse@postgres:5432/langfuse
+      CLICKHOUSE_URL: http://clickhouse:8123
+    depends_on:
+      - postgres
+      - clickhouse
+
+  postgres:
+    image: postgres:15
+    container_name: guardeye-langfuse-postgres
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-pg:/var/lib/postgresql/data
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: guardeye-langfuse-clickhouse
+    volumes:
+      - langfuse-ch:/var/lib/clickhouse
+
+volumes:
+  qdrant-data:
+  redis-data:
+  langfuse-pg:
+  langfuse-ch:

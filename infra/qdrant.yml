@@ -1,0 +1,15 @@
+# Qdrant 独立部署（最小可跑）。也可用根目录 docker-compose.yml 里的 qdrant 服务。
+# 用法：docker compose -f infra/qdrant.yml up -d
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: guardeye-qdrant
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  qdrant-data:
