@@ -2,35 +2,105 @@
 
 职责：
 - 接收协调 Agent 分发的视频片段 + 规则；
-- 执行 L0→L1→L2 三级路由；
-- 返回候选 Finding 列表。
+- 执行 L0→L1→L2 三级模型路由；
+- 返回候选 Finding 列表 + 成本明细。
 
-设计原则：
-- **无状态化**：输入只有 clip + rule，输出只有 finding，不保存中间帧；
-- **幂等性**：同一任务执行多次结果一致；
-- **成本记账**：每帧记录处理成本，回传给协调 Agent。
+设计要点：
+- 内部基于 LangGraph 子图编排：analyze 节点（内部封装 L0/L1/L2 三级路由）；
+- 无状态化：输入只有 clip + rule，输出只有 finding，不保存中间帧；
+- 幂等性：同一任务执行多次结果一致。
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Annotated, Any, TypedDict
+
+import operator
 
 from a2a_protocol.message_schema import A2AMessage, A2AResult
 from a2a_protocol.redis_stream import RedisStreamClient
 
 
+# ============================================================
+# Perception Agent 子图状态
+# ============================================================
+class PerceptionState(TypedDict, total=False):
+    """感知 Agent 内部状态。"""
+
+    task: dict  # AnalysisTask 的字典形式
+    finding: dict | None
+    cost: dict
+    logs: Annotated[list, operator.add]
+
+
+# ============================================================
+# Node 包装器（内部走三级路由）
+# ============================================================
+def _analyze_node(state: PerceptionState) -> dict:
+    """执行三级路由分析（L0 运动检测 → L1 抽帧去重 → L2 VLM 初筛）。"""
+    from agents.models import AnalysisTask, Finding, Rule
+    from agents.prescreen.router import Router
+
+    task_dict = state.get("task", {})
+    if not task_dict:
+        return {"finding": None, "cost": {}, "logs": [{"node": "perception", "message": "空任务"}]}
+
+    task = AnalysisTask(
+        id=task_dict.get("id", ""),
+        camera_id=task_dict.get("camera_id", ""),
+        rule=Rule(**task_dict.get("rule", {})),
+        clip_path=task_dict.get("clip_path", ""),
+    )
+
+    # 使用 Router 走三级路由（L0→L1→L2）
+    router = Router()
+    finding, breakdown = router.route(task)
+
+    return {
+        "finding": finding.model_dump(),
+        "cost": {
+            "l1_kept_frames": breakdown.l1_kept_frames,
+            "l2_screened_frames": breakdown.l2_screened_frames,
+            "l2_hit_frames": breakdown.l2_hit_frames,
+            "total_tokens": breakdown.total_tokens,
+            "total_cost": breakdown.total_cost,
+        },
+        "logs": [{"node": "perception", "message": f"分析完成 {task.id} hit={finding.hit}"}],
+    }
+
+
+# ============================================================
+# LangGraph 子图构建
+# ============================================================
+def build_perception_graph():
+    """构建感知 Agent 的 LangGraph 子图：analyze（内部 L0→L1→L2）。
+
+    当前为单节点封装，三级路由在 _analyze_node 内部通过 Router 顺序执行。
+    未来可按 L0/L1/L2 拆分为独立 node，实现更细粒度的 checkpoint 与并发采样。
+    """
+    from langgraph.graph import END, START, StateGraph
+
+    builder = StateGraph(PerceptionState)
+    builder.add_node("analyze", _analyze_node)
+    builder.add_edge(START, "analyze")
+    builder.add_edge("analyze", END)
+    return builder.compile()
+
+
+# ============================================================
+# Agent 封装
+# ============================================================
 class PerceptionAgent:
-    """感知 Agent：三级路由视频分析。"""
+    """感知 Agent：三级路由视频分析。内部由 LangGraph 子图编排。"""
 
     def __init__(self, agent_id: str, redis_client=None):
         self.agent_id = agent_id
         self.redis = RedisStreamClient(redis_client=redis_client)
+        self._graph = build_perception_graph()
 
     def analyze(self, clip_path: str, rule: dict, camera_id: str) -> dict:
-        """执行三级路由分析（复用现有 prescreen 逻辑）。"""
-        # 复用现有 agents/prescreen/ 下的实现
-        from agents.nodes.prescreen import analyze_task
+        """执行三级路由分析（通过 LangGraph 子图）。"""
         from agents.models import AnalysisTask, Rule
 
         task = AnalysisTask(
@@ -39,14 +109,16 @@ class PerceptionAgent:
             rule=Rule(**rule),
             clip_path=clip_path,
         )
-        # analyze_task 内部调用 toolbox，这里简化为直接调用
-        # 生产环境中，感知 Agent 应有自己的 Toolbox 实例（只连接 video_analysis MCP）
-        finding = analyze_task(task, toolbox=None)
+
+        initial_state: PerceptionState = {"task": task.model_dump()}
+        final_state = self._graph.invoke(initial_state)
+
+        finding = final_state.get("finding")
         if finding is None:
-            return {"findings": [], "cost": {"l0": 0, "l1": 0, "l2": 0}}
+            return {"findings": [], "cost": final_state.get("cost", {})}
         return {
-            "findings": [finding.model_dump()],
-            "cost": {"l0": 10, "l1": 5, "l2": 1},  # 占位，真实应从 router 记账
+            "findings": [finding],
+            "cost": final_state.get("cost", {}),
         }
 
     def process_message(self, message: A2AMessage) -> A2AResult:
