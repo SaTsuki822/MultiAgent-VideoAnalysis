@@ -55,11 +55,28 @@ class MCPClient:
             response = self._server.handle_rpc(message)
         elif self._http_url is not None:
             with httpx.Client(timeout=self._timeout) as client:
-                resp = client.post(self._http_url, json=message)
+                # 声明支持 SSE（Streamable HTTP），Server 优先返回 SSE 格式
+                headers = {"Accept": "text/event-stream, application/json"}
+                resp = client.post(self._http_url, json=message, headers=headers)
                 resp.raise_for_status()
-                response = resp.json()
+
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/event-stream" in content_type:
+                    # 解析 SSE 响应：提取 data: 行中的 JSON
+                    response = self._parse_sse(resp.text)
+                else:
+                    response = resp.json()
         else:
             raise RuntimeError("MCPClient 未配置任何传输")
         if "error" in response:
             raise RuntimeError(f"MCP error: {response['error']}")
         return response.get("result", {})
+
+    @staticmethod
+    def _parse_sse(text: str) -> dict:
+        """解析 SSE 响应体，提取 `data: <json>` 行并反序列化。"""
+        for line in text.strip().splitlines():
+            if line.startswith("data:"):
+                data = line[len("data:"):].strip()
+                return json.loads(data)
+        raise RuntimeError("SSE 响应中未找到有效的 data 行")

@@ -141,7 +141,12 @@ class MCPServer:
                 sys.stdout.flush()
 
     def run_http(self, host: str = "127.0.0.1", port: int = 8000) -> None:
-        """Streamable HTTP 传输（标准库实现，无框架依赖）。"""
+        """Streamable HTTP 传输（SSE 实现，标准库，无框架依赖）。
+
+        支持两种响应模式：
+        1. 客户端请求头带 `Accept: text/event-stream` → 返回 SSE 流式格式；
+        2. 客户端不支持 SSE → 返回普通 JSON（向后兼容）。
+        """
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         server = self
@@ -150,21 +155,38 @@ class MCPServer:
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length)
+
+                # 判断客户端是否支持 SSE
+                accept = self.headers.get("Accept", "")
+                supports_sse = "text/event-stream" in accept
+
                 try:
                     message = json.loads(body)
                     response = server.handle_rpc(message)
                 except Exception as exc:
                     response = server._error(None, PARSE_ERROR, str(exc))
-                payload = json.dumps(response, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
+
+                if supports_sse and response is not None:
+                    # SSE 格式：text/event-stream，data: <json>\n\n
+                    payload = json.dumps(response, ensure_ascii=False)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.end_headers()
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                else:
+                    # 普通 JSON 返回（向后兼容）
+                    payload = json.dumps(response, ensure_ascii=False).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
 
             def log_message(self, *args):
                 pass  # 静默访问日志
 
         httpd = HTTPServer((host, port), Handler)
-        print(f"[{self.name}] MCP server listening on http://{host}:{port}", file=sys.stderr)
+        print(f"[{self.name}] MCP server listening on http://{host}:{port} (Streamable HTTP/SSE)", file=sys.stderr)
         httpd.serve_forever()
