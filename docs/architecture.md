@@ -155,7 +155,7 @@ Redis Stream 选型理由：轻量、与现有 Redis（Checkpoint）可共用、
 | MCP 传输 | `MCPClient` | HTTP / stdio | InProcess |
 | 运行形态 | — | `build_graph()`（LangGraph） | `run_pipeline()`（纯 Python） |
 | 多 Agent 通信 | `A2AMessage` | Redis Stream | 内存队列（单测用） |
-| 负载均衡 | `LoadBalancer` | Round Robin + 健康检查 | 单实例（降级） |
+| 负载均衡 | `LoadBalancer` | 加权最小负载（队列长度 × 任务预估权重）+ 健康检查 | 单实例（降级） |
 
 ---
 
@@ -166,6 +166,6 @@ Redis Stream 选型理由：轻量、与现有 Redis（Checkpoint）可共用、
 - 记忆系统长期演化（季节性场景变化）未做；
 - **多 Agent 分布式版**：当前为架构验证代码，未在真实大规模场景下测试；
 - 事件相机 / 主动抽帧可替代固定采样；
-- 感知 Agent 负载均衡当前为简单轮询，生产可扩展为按 GPU 利用率加权。
+- 感知 Agent 负载均衡当前为「队列长度 × 任务预估权重」加权调度，生产环境可进一步叠加 GPU 利用率做精细调度。
 
 每点都可对应一条改进方案（面试 Q17/Q19/Q23.5 的素材）。

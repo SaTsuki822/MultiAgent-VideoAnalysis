@@ -28,28 +28,80 @@ from a2a_protocol.redis_stream import RedisStreamClient
 class LoadBalancer:
     """感知 Agent 负载均衡器。
 
-    当前实现：简单轮询（Round Robin）。
-    生产可扩展为：按 GPU 利用率、队列长度、地理位置加权。
+    当前实现：基于「队列长度 × 任务预估权重」的加权最小负载调度。
+    相比 Round Robin，能感知任务异构性（简单初筛 vs 长耗时 VLM 分析），
+    把新任务优先分给当前加权负载最小的实例。
+
+    生产可扩展为：叠加 GPU 利用率、地理位置加权。
     """
 
     def __init__(self, agent_ids: list[str]):
         self.agent_ids = agent_ids
-        self._idx = 0
+        # 每个 Agent 当前的加权负载（已分发未确认的任务权重之和）
+        self.agent_loads: dict[str, float] = {aid: 0.0 for aid in agent_ids}
 
-    def pick(self) -> str:
-        agent_id = self.agent_ids[self._idx % len(self.agent_ids)]
-        self._idx += 1
-        return agent_id
+    @staticmethod
+    def _estimate_task_weight(task: dict) -> float:
+        """根据规则复杂度预估任务权重。
+
+        权重设计：
+        - 基础权重 1.0
+        - 持续型异常（需分析更长时间）：+1.0
+        - 目标对象多（检测更复杂）：每超 2 个 +0.5
+        - 判定证据维度多：每超 2 条 +0.5
+        """
+        rule = task.get("rule", {}) if isinstance(task, dict) else {}
+        weight = 1.0
+
+        # 持续型异常需要分析更长时间
+        duration = rule.get("duration_threshold_seconds") if isinstance(rule, dict) else None
+        if duration is not None:
+            weight += 1.0
+
+        # 目标对象多 = 检测更复杂
+        targets = rule.get("target_objects", []) if isinstance(rule, dict) else []
+        if len(targets) > 2:
+            weight += 0.5 * (len(targets) - 2)
+
+        # 证据维度多 = 复核更复杂
+        hints = rule.get("evidence_hints", []) if isinstance(rule, dict) else []
+        if len(hints) > 2:
+            weight += 0.5 * (len(hints) - 2)
+
+        return weight
+
+    def pick(self, task: dict | None = None) -> tuple[str, float]:
+        """选择当前加权负载最小的 Agent，并预占其负载。
+
+        Returns:
+            (agent_id, task_weight)：选中的 Agent ID 和该任务的预估权重
+        """
+        if not self.agent_ids:
+            raise RuntimeError("无可用感知Agent实例")
+
+        weight = self._estimate_task_weight(task) if task else 1.0
+        # 选择加权负载最小的实例
+        agent_id = min(self.agent_ids, key=lambda aid: self.agent_loads.get(aid, float("inf")))
+        self.agent_loads[agent_id] = self.agent_loads.get(agent_id, 0.0) + weight
+        return agent_id, weight
+
+    def release(self, agent_id: str, weight: float):
+        """任务完成或超时后释放加权负载。"""
+        if agent_id in self.agent_loads:
+            self.agent_loads[agent_id] = max(0.0, self.agent_loads[agent_id] - weight)
 
     def mark_unavailable(self, agent_id: str):
-        """标记某感知 Agent 不可用（如心跳超时）。"""
+        """标记某感知 Agent 不可用（如心跳超时），移除其负载记录。"""
         if agent_id in self.agent_ids:
             self.agent_ids.remove(agent_id)
+        self.agent_loads.pop(agent_id, None)
 
     def add(self, agent_id: str):
         """新感知 Agent 注册。"""
         if agent_id not in self.agent_ids:
             self.agent_ids.append(agent_id)
+        if agent_id not in self.agent_loads:
+            self.agent_loads[agent_id] = 0.0
 
 
 class Orchestrator:
@@ -93,26 +145,27 @@ class Orchestrator:
 
         流程：
         1. 为每个子任务生成 message_id；
-        2. 按负载均衡选择感知 Agent，写入 Redis Stream；
+        2. 按负载均衡（加权最小负载）选择感知 Agent，写入 Redis Stream；
         3. 轮询感知 Agent 的回调结果 Stream，收集返回；
-        4. 超时未返回的任务标记为失败。
+        4. 超时未返回的任务标记为失败，并释放对应加权负载。
         """
         if not tasks:
             return []
 
-        # 1. 发送任务
-        sent_ids: set[str] = set()
+        # 1. 发送任务（带加权负载均衡）
+        sent_ids: dict[str, tuple[str, float]] = {}  # message_id -> (agent_id, weight)
         for task in tasks:
+            agent_id, weight = self.load_balancer.pick(task)
             msg = A2AMessage(
                 message_id=f"msg_{uuid.uuid4().hex[:8]}",
                 from_agent="orchestrator",
-                to_agent=self.load_balancer.pick(),
+                to_agent=agent_id,
                 task="analyze_clip",
                 payload=task,
                 timeout_sec=timeout_sec,
             )
             self.redis.send_task(msg)
-            sent_ids.add(msg.message_id)
+            sent_ids[msg.message_id] = (agent_id, weight)
 
         # 2. 收集结果（轮询，最多等 timeout_sec）
         results: list[A2AResult] = []
@@ -121,12 +174,15 @@ class Orchestrator:
             for agent_id in self.load_balancer.agent_ids:
                 for res in self.redis.consume_results(agent_id, count=100, block_ms=1000):
                     if res.message_id in sent_ids:
-                        sent_ids.remove(res.message_id)
+                        picked_agent, weight = sent_ids.pop(res.message_id)
+                        # 释放该 Agent 的加权负载
+                        self.load_balancer.release(picked_agent, weight)
                         results.append(res)
             time.sleep(0.5)
 
-        # 3. 未返回的标记为超时
-        for missing_id in sent_ids:
+        # 3. 未返回的标记为超时，并释放负载
+        for missing_id, (agent_id, weight) in sent_ids.items():
+            self.load_balancer.release(agent_id, weight)
             results.append(
                 A2AResult(
                     message_id=missing_id,

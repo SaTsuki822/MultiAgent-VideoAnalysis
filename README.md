@@ -56,6 +56,7 @@ flowchart TD
 |------|------|
 | **多 Agent 协作** | 规划 + 协调 + 感知 + 决策 + 执行，感知层水平扩展 |
 | **A2A 通信** | Redis Stream 异步分发 + HTTP 同步调用，ACK 保证交付 |
+| **加权负载均衡** | 协调 Agent 按「队列长度 × 任务预估权重」分发任务，优先分给当前加权负载最小的感知 Agent 实例，避免任务异构导致的 GPU 浪费 |
 | **LangGraph 状态图** | checkpoint 断点续跑 + interrupt 人工介入 + reducer 并发合并 |
 | **ReAct 规则编译** | 规划 Agent 对陌生规则采用「思考 → 查 SOP → 推理」自主探索，已知规则走关键词表零成本编译 |
 | **MCP 工具层** | JSON-RPC + `tools/list` 发现 + stdio/HTTP 双传输，5 个 Server |
