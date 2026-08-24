@@ -15,7 +15,7 @@ Agent 闭环：
 2. **规划 Agent** 对已知规则走关键词表确定性编译，对陌生规则通过 ReAct（思考→查 SOP→推理）
    自主探索并输出结构化子任务；
 3. **感知 Agent** 用三级模型路由分析视频片段，产出候选发现；
-4. **决策 Agent** 做跨帧一致性复核、SOP 核对、历史误报检索；
+4. **决策 Agent** 做跨帧一致性复核、SOP 核对、时序聚合（持续型异常跨片段累计）、历史误报检索；
 5. **执行 Agent** 触发人工确认 / 告警 / 工单，并把误报写回记忆库。
 
 
@@ -33,7 +33,7 @@ flowchart TD
     PE1 --> OR
     PE2 --> OR
     PEN --> OR
-    OR --> DE[决策 Agent<br/>跨帧一致性 + SOP 复核 + 记忆检索]
+    OR --> DE[决策 Agent<br/>跨帧一致性 + SOP 复核 + 时序聚合 + 记忆检索]
     DE --> AC[执行 Agent<br/>人工确认 / 告警 / 工单 / 报告]
     AC --> FP[(误报记忆库 Qdrant)]
     AC -.标记误报.-> FP
@@ -45,7 +45,7 @@ flowchart TD
 **多 Agent 协作**是扩展性核心：感知 Agent 为**无状态服务**，路数增加时直接增加实例，协调 Agent
 负责任务分片与故障恢复。
 
-单 Agent 流水线：`plan → fetch → dispatch → verify → memory_filter → hitl → report → notify`，
+单 Agent 流水线：`plan → fetch → dispatch → verify → temporal_aggregate → memory_filter → hitl → report → notify`，
 由 LangGraph `StateGraph` 编排，支持 checkpoint 断点续跑与 interrupt 人工介入。
 
 ---
@@ -59,11 +59,12 @@ flowchart TD
 | **加权负载均衡** | 协调 Agent 按「队列长度 × 任务预估权重」分发任务，优先分给当前加权负载最小的感知 Agent 实例，避免任务异构导致的 GPU 浪费 |
 | **LangGraph 状态图** | checkpoint 断点续跑 + interrupt 人工介入 + reducer 并发合并 |
 | **ReAct 规则编译** | 规划 Agent 对陌生规则采用「思考 → 查 SOP → 推理」自主探索，已知规则走关键词表零成本编译 |
-| **MCP 工具层** | JSON-RPC + `tools/list` 发现 + stdio/HTTP 双传输，5 个 Server |
+| **MCP 工具层** | JSON-RPC + `tools/list` 发现 + stdio / Streamable HTTP（SSE）双传输，向后兼容普通 HTTP，5 个 Server |
 | **三级模型路由** | 按「处理成本 × 信息密度」分层，成本可记账 |
 | **跨帧一致性** | 单帧不采信，滑动窗口连续 N 帧才升级，防 VLM 幻觉 |
+| **时序聚合** | 对持续型异常（`duration_threshold_seconds`）维护片段级状态机，跨片段累计时长，满足阈值后生成告警 |
 | **误报自学习记忆** | 结构化签名 + 向量检索 + 防污染规则，同类误报自动抑制 |
-| **可观测** | 集成 Langfuse 追踪多 Agent 调用链路 |
+| **成本可观测** | 三级路由逐层记账（帧数 / token / 金额），预留 Langfuse Trace 回填接口 |
 
 ---
 
@@ -77,8 +78,8 @@ flowchart TD
 | 视频处理 | OpenCV（抽帧 / 帧差运动检测）、NumPy、Pillow |
 | LLM / VLM | OpenAI 兼容端点（SGLang 部署 Qwen2.5-VL 等），默认 mock 降级 |
 | Agent 间通信 | Redis Stream（多 Agent 分布式版） |
-| 可观测 | Langfuse |
-| 前端复核台 | Streamlit |
+| 成本追踪 | 三级路由逐层记账，预留 Langfuse Trace 回填接口 |
+| 前端复核台 | Streamlit（简化版，展示 HITL 交互形态） |
 
 ---
 
@@ -87,14 +88,15 @@ flowchart TD
 ```
 guard-eye-agent/
 ├── agents/                     # 核心包（单 Agent 版）
-│   ├── models.py               # 数据模型（Rule / Finding / Alarm / Report）
+│   ├── models.py               # 数据模型（Rule / Finding / Alarm / OngoingAnomaly / Report）
 │   ├── state.py                # PatrolState + reducer
 │   ├── config.py               # 集中配置（环境变量 + 默认值双层）
 │   ├── llm.py                  # LLM / VLM 客户端（真实 + mock）
 │   ├── toolbox.py              # 5 个 MCP Server 的访问封装
+│   ├── temporal_store.py       # 持续异常活跃状态存储（内存 + JSON 持久化）
 │   ├── prescreen/              # L0 运动检测 / L1 抽帧去重 / L2 VLM / 路由
 │   ├── memory/                 # 误报记忆 / 事件记忆 / 向量存储 / embedding
-│   ├── nodes/                  # LangGraph 各节点
+│   ├── nodes/                  # LangGraph 各节点（含 temporal_aggregator）
 │   └── workflow.py             # 主状态图 + 纯 Python 降级流水线
 │
 ├── multi_agent/                # 多 Agent 分布式版
@@ -102,7 +104,7 @@ guard-eye-agent/
 │   ├── orchestrator/           # 协调 Agent（任务分片、结果聚合）
 │   ├── planner_agent/          # 规划 Agent（规则解析、任务分解）
 │   ├── perception_agent/       # 感知 Agent（三级路由，无状态，可水平扩展）
-│   ├── decision_agent/         # 决策 Agent（复核、记忆检索、风险定级）
+│   ├── decision_agent/         # 决策 Agent（复核、时序聚合、记忆检索、风险定级）
 │   └── action_agent/           # 执行 Agent（人工确认、告警工单、报告）
 │
 ├── mcp_servers/                # 自研 MCP 核心 + 5 个 Server + 客户端
