@@ -66,6 +66,10 @@ class Toolbox:
     def search_similar_events(self, query: str, limit: int = 3) -> list[dict]:
         return self.knowledge.call_tool("search_similar_events", {"query": query, "limit": limit})["results"]
 
+    def list_tools(self) -> list[dict]:
+        """返回规则编译可用的工具 schema（MCP tools/list 格式），供 Function Calling 使用。"""
+        return [t for t in self.knowledge.list_tools() if t["name"] == "search_sop"]
+
     # ---- alarm ----
     def create_alarm(self, camera_id: str, rule_id: str, rule_name: str, severity: str, confidence: float, evidence: list) -> dict:
         return self.alarm.call_tool(

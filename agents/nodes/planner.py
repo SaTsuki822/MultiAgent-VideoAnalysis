@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import re
 
-from agents.llm import LLMClient, MockLLMClient, get_llm_client
+from agents.llm import LLMClient, MockLLMClient, ToolCall, get_llm_client, mcp_tools_to_openai
 from agents.models import AnalysisTask, LogEntry, Rule
 from agents.toolbox import Toolbox
 
@@ -106,8 +106,33 @@ def _parse_search_sop_action(action_str: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
-def _react_compile(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_steps: int = 3) -> Rule:
-    """ReAct 编译：对陌生规则自主探索，查 SOP → 推理 → 输出结构化配置。
+def _apply_final(rule: Rule, final: dict) -> Rule:
+    """把编译结果 dict 写回 rule；字段类型不对则回退确定性编译。"""
+    try:
+        rule.target_objects = list(final.get("target_objects", []))
+        rule.evidence_hints = list(final.get("evidence_hints", []))
+        duration = final.get("duration_threshold_seconds")
+        rule.duration_threshold_seconds = float(duration) if duration is not None else None
+        return rule
+    except (TypeError, ValueError):
+        return _deterministic_compile(rule)
+
+
+def _parse_final(raw: str) -> dict | None:
+    """从最终文本解析结构化结果：兼容 "Final Answer: {...}" 与纯 JSON 两种形态。"""
+    if not raw:
+        return None
+    final = _extract_final_answer(raw)
+    if final is not None:
+        return final
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _react_compile_text(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_steps: int = 3) -> Rule:
+    """文本 ReAct 编译：模型输出 Thought/Action 文本，代码解析并执行 search_sop。
 
     循环：Thought → Action(search_sop) → Observation → ...
     超步或解析失败则回退到 _deterministic_compile。
@@ -120,24 +145,15 @@ def _react_compile(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_steps: int 
             raw = llm.complete(
                 system="你是巡检规则编译助手。严格按 Thought/Action/Final Answer 格式输出。",
                 user=prompt,
-                temperature=0.2,
             )
         except Exception:
             # LLM 调用失败，立即回退
             return _deterministic_compile(rule)
 
         # 检查是否已经输出最终答案
-        final = _extract_final_answer(raw)
+        final = _parse_final(raw)
         if final is not None:
-            try:
-                rule.target_objects = list(final.get("target_objects", []))
-                rule.evidence_hints = list(final.get("evidence_hints", []))
-                duration = final.get("duration_threshold_seconds")
-                rule.duration_threshold_seconds = float(duration) if duration is not None else None
-                return rule
-            except (TypeError, ValueError):
-                # 解析成功但字段类型不对，继续回退
-                return _deterministic_compile(rule)
+            return _apply_final(rule, final)
 
         # 否则提取 Thought + Action，执行工具调用
         thought = _extract_thought(raw)
@@ -161,6 +177,85 @@ def _react_compile(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_steps: int 
 
     # 超步或中间失败 → 回退确定性编译
     return _deterministic_compile(rule)
+
+
+def _build_fc_user_prompt(rule: Rule) -> str:
+    """Function Calling 编译的用户 prompt：要求模型调 search_sop 后输出纯 JSON。"""
+    return (
+        f"规则名称：{rule.name}\n"
+        f"规则描述：{rule.description}\n\n"
+        "请通过调用 search_sop 工具查询相关判定依据，理解规则后输出最终答案（纯 JSON）：\n"
+        '{"target_objects": [...], "evidence_hints": [...], "duration_threshold_seconds": null}\n'
+        "约束：target_objects 是英文标识符（如 person, helmet, fire）；evidence_hints 是中文视觉证据描述；"
+        "duration_threshold_seconds 为 null 表示单帧即判定，有持续要求时填秒数；最多调用 3 次工具。"
+    )
+
+
+def _assistant_message(resp: "ToolCallResponse") -> dict:
+    """把 ToolCallResponse 转回 OpenAI 消息格式的 assistant 消息（含 tool_calls）。"""
+    tool_calls = [
+        {
+            "id": tc.id,
+            "type": "function",
+            "function": {"name": tc.name, "arguments": json.dumps(tc.arguments, ensure_ascii=False)},
+        }
+        for tc in resp.tool_calls
+    ]
+    return {"role": "assistant", "content": resp.content, "tool_calls": tool_calls}
+
+
+def _execute_tool_call(tool_call: ToolCall, toolbox: Toolbox):
+    """执行模型请求的 tool_call。当前只暴露 search_sop，走 Toolbox 语义方法。"""
+    if tool_call.name == "search_sop":
+        query = tool_call.arguments.get("query", "")
+        limit = int(tool_call.arguments.get("limit", 3))
+        return toolbox.search_sop(query, limit=limit)
+    return {"error": f"unknown tool: {tool_call.name}"}
+
+
+def _react_compile_with_tools(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_steps: int = 3) -> Rule:
+    """原生 Function Calling 编译：模型直接输出 search_sop 的 tool_call，框架执行后喂回结果。
+
+    与 _react_compile_text 的区别：不再用文本解析 "Action: search_sop(...)"，
+    而是模型原生输出 tool_calls；多轮循环按 OpenAI 协议组织
+    （assistant.tool_calls → tool 角色结果 → 下一轮）。
+    """
+    # 从 MCP tools/list 拉取 search_sop 的 schema，转成 OpenAI tools 格式
+    tools = mcp_tools_to_openai(toolbox.list_tools())
+    messages: list[dict] = [
+        {"role": "system", "content": "你是巡检规则编译助手。可调用 search_sop 查询 SOP，最终输出结构化判定依据。"},
+        {"role": "user", "content": _build_fc_user_prompt(rule)},
+    ]
+
+    for _step in range(max_steps):
+        try:
+            resp = llm.complete_with_tools(messages, tools)
+        except Exception:
+            return _deterministic_compile(rule)
+
+        # 没有 tool_call → 模型认为已可作答，尝试解析最终答案
+        if not resp.tool_calls:
+            final = _parse_final(resp.content or "")
+            if final is not None:
+                return _apply_final(rule, final)
+            return _deterministic_compile(rule)
+
+        # 有 tool_call → 记入消息历史，执行并把结果作为 tool 消息喂回
+        messages.append(_assistant_message(resp))
+        for tc in resp.tool_calls:
+            observation = _execute_tool_call(tc, toolbox)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(observation, ensure_ascii=False)})
+
+    return _deterministic_compile(rule)
+
+
+def _react_compile(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_steps: int = 3) -> Rule:
+    """ReAct 编译分发：真实客户端支持原生 Function Calling 则走 tool-call 循环，
+    否则走文本 ReAct。两者都以 _deterministic_compile 兜底。
+    """
+    if getattr(llm, "supports_tool_calling", False):
+        return _react_compile_with_tools(rule, llm, toolbox, max_steps)
+    return _react_compile_text(rule, llm, toolbox, max_steps)
 
 
 def _llm_compile(rule: Rule, llm: LLMClient) -> Rule:

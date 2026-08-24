@@ -61,6 +61,20 @@ class FakeToolbox:
     def search_similar_events(self, query, limit=3):
         return []
 
+    def list_tools(self):
+        # 与真实 knowledge server 的 search_sop schema 一致（供 Function Calling 测试）
+        return [
+            {
+                "name": "search_sop",
+                "description": "检索与查询相关的 SOP 判定依据。参数 query、limit（默认 3）。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                    "required": ["query"],
+                },
+            }
+        ]
+
     def create_alarm(self, camera_id, rule_id, rule_name, severity, confidence, evidence):
         self.counter += 1
         return {
