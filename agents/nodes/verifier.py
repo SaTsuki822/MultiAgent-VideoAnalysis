@@ -18,6 +18,13 @@ from agents.models import Alarm, Finding, LogEntry, Verification
 from agents.toolbox import Toolbox
 
 
+def _get_field(obj, key: str, default=None):
+    """兼容 dict 与 Pydantic 模型的字段读取（避免 getattr 默认参数被提前求值）。"""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 def passes_consistency(finding: Finding, window_size: int, max_gap_seconds: float) -> bool:
     """滑动窗口跨帧一致性：是否存在 window_size 个命中帧，且首尾时间差 <= max_gap_seconds。
 
@@ -92,10 +99,10 @@ def verifier_node(state: dict, toolbox: Toolbox) -> dict:
             rule = t.rule
         else:
             rule = t.get("rule", {})
-        rid = getattr(rule, "id", rule.get("id", ""))
-        severity = getattr(rule, "severity", rule.get("severity", "medium"))
-        name = getattr(rule, "name", rule.get("name", rid))
-        duration = getattr(rule, "duration_threshold_seconds", rule.get("duration_threshold_seconds"))
+        rid = _get_field(rule, "id", "")
+        severity = _get_field(rule, "severity", "medium")
+        name = _get_field(rule, "name", rid)
+        duration = _get_field(rule, "duration_threshold_seconds")
         if rid:
             rule_meta[rid] = (severity, name, duration)
 

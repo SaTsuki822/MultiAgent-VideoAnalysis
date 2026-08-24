@@ -13,7 +13,7 @@ from pathlib import Path
 from mcp_servers._core import MCPServer
 
 # mock 台账：10 路摄像头覆盖工地典型点位
-_MOCK_CAMERAS: list[dict] = [
+MOCK_CAMERAS: list[dict] = [
     {"id": "cam_001", "name": "东门入口", "area": "gate_east", "rtsp_url": "rtsp://mock/nvr/cam_001"},
     {"id": "cam_002", "name": "西门入口", "area": "gate_west", "rtsp_url": "rtsp://mock/nvr/cam_002"},
     {"id": "cam_003", "name": "1号楼基坑", "area": "zone_a_excavation", "rtsp_url": "rtsp://mock/nvr/cam_003"},
@@ -42,8 +42,8 @@ def _load_cameras() -> list[dict]:
         except Exception:
             pass
     # 回退 mock 并持久化
-    _save_cameras(_MOCK_CAMERAS)
-    return list(_MOCK_CAMERAS)
+    _save_cameras(MOCK_CAMERAS)
+    return list(MOCK_CAMERAS)
 
 
 def _save_cameras(cameras: list[dict]) -> None:

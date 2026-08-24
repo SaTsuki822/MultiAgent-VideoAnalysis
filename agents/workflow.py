@@ -17,6 +17,7 @@ from typing import Callable
 from agents.nodes import dispatcher, fetcher, hitl, memory_filter, notifier, planner, reporter, temporal_aggregator, verifier
 from agents.state import PatrolState, merge_by_id
 from agents.toolbox import Toolbox
+from agents.tracing import Tracer, summarize_state
 
 # 追加式 reducer 字段与按 id 合并字段（与 state.py 保持一致）
 _APPEND_FIELDS = {"findings", "verifications", "feedback", "logs"}
@@ -36,6 +37,21 @@ def merge_state(state: dict, update: dict) -> dict:
     return new
 
 
+def _wrap_node(name: str, fn: Callable, tracer: "Tracer | None") -> Callable:
+    """若有 tracer，给节点包一层执行轨迹采集（计时 + 输入/输出摘要 + 状态）。"""
+    if tracer is None:
+        return fn
+
+    def wrapped(state: dict) -> dict:
+        with tracer.span(name) as span:
+            span.input_summary = {"state_keys": list(state.keys())}
+            update = fn(state) or {}
+            span.output_summary = summarize_state(update)
+            return update
+
+    return wrapped
+
+
 def _interrupt_handler(pending):
     """LangGraph 图里的人工介入：调 interrupt 挂起，等待 Command(resume=...) 恢复。"""
     from langgraph.types import interrupt
@@ -43,21 +59,21 @@ def _interrupt_handler(pending):
     return interrupt({"pending_review": [a.model_dump() for a in pending]})
 
 
-def build_graph(toolbox: Toolbox, hitl_handler: Callable | None = None, checkpointer=None):
+def build_graph(toolbox: Toolbox, hitl_handler: Callable | None = None, checkpointer=None, tracer: "Tracer | None" = None):
     """构建 LangGraph 状态图。checkpointer 默认 MemorySaver，可传 SqliteSaver 持久化。"""
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.graph import END, START, StateGraph
 
     builder = StateGraph(PatrolState)
-    builder.add_node("plan", partial(planner.planner_node, toolbox=toolbox))
-    builder.add_node("fetch", partial(fetcher.fetcher_node, toolbox=toolbox))
-    builder.add_node("dispatch", partial(dispatcher.dispatch_node, toolbox=toolbox))
-    builder.add_node("verify", partial(verifier.verifier_node, toolbox=toolbox))
-    builder.add_node("temporal_aggregate", partial(temporal_aggregator.temporal_aggregate_node, toolbox=toolbox))
-    builder.add_node("memory_filter", partial(memory_filter.memory_filter_node, toolbox=toolbox))
-    builder.add_node("hitl", partial(hitl.hitl_node, toolbox=toolbox, hitl_handler=hitl_handler or _interrupt_handler))
-    builder.add_node("report", partial(reporter.reporter_node, toolbox=toolbox))
-    builder.add_node("notify", partial(notifier.notifier_node, toolbox=toolbox))
+    builder.add_node("plan", _wrap_node("plan", partial(planner.planner_node, toolbox=toolbox), tracer))
+    builder.add_node("fetch", _wrap_node("fetch", partial(fetcher.fetcher_node, toolbox=toolbox), tracer))
+    builder.add_node("dispatch", _wrap_node("dispatch", partial(dispatcher.dispatch_node, toolbox=toolbox), tracer))
+    builder.add_node("verify", _wrap_node("verify", partial(verifier.verifier_node, toolbox=toolbox), tracer))
+    builder.add_node("temporal_aggregate", _wrap_node("temporal_aggregate", partial(temporal_aggregator.temporal_aggregate_node, toolbox=toolbox), tracer))
+    builder.add_node("memory_filter", _wrap_node("memory_filter", partial(memory_filter.memory_filter_node, toolbox=toolbox), tracer))
+    builder.add_node("hitl", _wrap_node("hitl", partial(hitl.hitl_node, toolbox=toolbox, hitl_handler=hitl_handler or _interrupt_handler), tracer))
+    builder.add_node("report", _wrap_node("report", partial(reporter.reporter_node, toolbox=toolbox), tracer))
+    builder.add_node("notify", _wrap_node("notify", partial(notifier.notifier_node, toolbox=toolbox), tracer))
 
     builder.add_edge(START, "plan")
     builder.add_edge("plan", "fetch")
@@ -73,21 +89,24 @@ def build_graph(toolbox: Toolbox, hitl_handler: Callable | None = None, checkpoi
     return builder.compile(checkpointer=checkpointer or MemorySaver())
 
 
-def run_pipeline(initial_state: dict, toolbox: Toolbox, hitl_handler: Callable | None = None) -> dict:
-    """纯 Python 顺序执行节点（降级形态）。返回完整 state。"""
+def run_pipeline(initial_state: dict, toolbox: Toolbox, hitl_handler: Callable | None = None, tracer: "Tracer | None" = None) -> dict:
+    """纯 Python 顺序执行节点（降级形态）。返回完整 state。
+
+    可选传入 tracer：采集每个节点的执行轨迹（耗时/状态/摘要），用于轨迹分析。
+    """
     state = dict(initial_state)
-    nodes = [
-        partial(planner.planner_node, toolbox=toolbox),
-        partial(fetcher.fetcher_node, toolbox=toolbox),
-        partial(dispatcher.dispatch_node, toolbox=toolbox),
-        partial(verifier.verifier_node, toolbox=toolbox),
-        partial(temporal_aggregator.temporal_aggregate_node, toolbox=toolbox),
-        partial(memory_filter.memory_filter_node, toolbox=toolbox),
-        partial(hitl.hitl_node, toolbox=toolbox, hitl_handler=hitl_handler),
-        partial(reporter.reporter_node, toolbox=toolbox),
-        partial(notifier.notifier_node, toolbox=toolbox),
+    nodes: list[tuple[str, Callable]] = [
+        ("plan", partial(planner.planner_node, toolbox=toolbox)),
+        ("fetch", partial(fetcher.fetcher_node, toolbox=toolbox)),
+        ("dispatch", partial(dispatcher.dispatch_node, toolbox=toolbox)),
+        ("verify", partial(verifier.verifier_node, toolbox=toolbox)),
+        ("temporal_aggregate", partial(temporal_aggregator.temporal_aggregate_node, toolbox=toolbox)),
+        ("memory_filter", partial(memory_filter.memory_filter_node, toolbox=toolbox)),
+        ("hitl", partial(hitl.hitl_node, toolbox=toolbox, hitl_handler=hitl_handler)),
+        ("report", partial(reporter.reporter_node, toolbox=toolbox)),
+        ("notify", partial(notifier.notifier_node, toolbox=toolbox)),
     ]
-    for node in nodes:
-        update = node(state) or {}
+    for name, node in nodes:
+        update = _wrap_node(name, node, tracer)(state) or {}
         state = merge_state(state, update)
     return state
