@@ -61,6 +61,10 @@ class AnalysisTask(BaseModel):
     rule: Rule
     clip_path: str
     output_schema: str = "finding"
+    # 时序聚合需要绝对时间信息
+    clip_start_time: Optional[datetime] = None
+    clip_end_time: Optional[datetime] = None
+    duration_seconds: float = 0.0
 
 
 # ============================================================
@@ -86,6 +90,10 @@ class Finding(BaseModel):
     # 成本记账（对应面试 Q14）
     cost_tokens: int = 0
     cost_currency: float = 0.0
+    # 时序聚合需要绝对时间信息（由 router 从 AnalysisTask 带入）
+    clip_start_time: Optional[datetime] = None
+    clip_end_time: Optional[datetime] = None
+    duration_seconds: float = 0.0
 
 
 class Verification(BaseModel):
@@ -98,8 +106,44 @@ class Verification(BaseModel):
 
 
 # ============================================================
-# 告警 / 记忆 / 报告层
+# 时序聚合 / 持续异常跟踪层
 # ============================================================
+
+class OngoingAnomaly(BaseModel):
+    """持续型异常的片段级状态机跟踪记录。
+
+    以 (camera_id, rule_id) 为唯一键，跨片段累计异常持续时间。
+    """
+    camera_id: str
+    rule_id: str
+    rule_name: str = ""
+    severity: Severity = "medium"
+    duration_threshold_seconds: float = 0.0
+
+    # 状态机状态
+    state: Literal["idle", "detected", "accumulating", "confirmed", "closed"] = "idle"
+
+    # 时间轴（绝对时间，来自 clip_start_time / clip_end_time）
+    first_seen_at: Optional[datetime] = None   # 首次命中片段的开始时间
+    last_seen_at: Optional[datetime] = None    # 最新命中片段的结束时间
+    accumulated_seconds: float = 0.0           # 累计持续秒数（视频时间轴）
+
+    # 证据累积（取各片段的关键帧证据，避免无限增长可限制条数）
+    evidence_snapshots: list[FrameEvidence] = Field(default_factory=list)
+
+    # 关联告警（confirmed 后生成）
+    alarm_id: Optional[str] = None
+
+    # 元数据
+    hit_count: int = 0          # 累计命中片段数
+    miss_count: int = 0         # 连续未命中片段数（用于超时关闭）
+    updated_at: datetime = Field(default_factory=datetime.now)
+
+    def compute_duration(self) -> float:
+        """基于 first_seen_at 与 last_seen_at 计算视频时间轴跨度（秒）。"""
+        if self.first_seen_at and self.last_seen_at:
+            return (self.last_seen_at - self.first_seen_at).total_seconds()
+        return self.accumulated_seconds
 class Alarm(BaseModel):
     """一条（待复核 / 已确认 / 已抑制）告警。"""
     id: str

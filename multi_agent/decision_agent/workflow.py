@@ -19,6 +19,7 @@ import operator
 
 from agents.models import LogEntry
 from agents.nodes.memory_filter import memory_filter_node
+from agents.nodes.temporal_aggregator import temporal_aggregate_node
 from agents.nodes.verifier import verifier_node
 from agents.state import merge_by_id
 from agents.toolbox import Toolbox
@@ -45,6 +46,10 @@ def _verify_node(state: DecisionState, toolbox: Toolbox) -> dict:
     return verifier_node(state, toolbox)
 
 
+def _temporal_aggregate_node(state: DecisionState, toolbox: Toolbox) -> dict:
+    return temporal_aggregate_node(state, toolbox)
+
+
 def _memory_filter_node(state: DecisionState, toolbox: Toolbox) -> dict:
     return memory_filter_node(state, toolbox)
 
@@ -53,17 +58,19 @@ def _memory_filter_node(state: DecisionState, toolbox: Toolbox) -> dict:
 # LangGraph 子图构建
 # ============================================================
 def build_decision_graph(toolbox: Toolbox):
-    """构建决策 Agent 的 LangGraph 子图：verify → memory_filter。"""
+    """构建决策 Agent 的 LangGraph 子图：verify → temporal_aggregate → memory_filter。"""
     from functools import partial
 
     from langgraph.graph import END, START, StateGraph
 
     builder = StateGraph(DecisionState)
     builder.add_node("verify", partial(_verify_node, toolbox=toolbox))
+    builder.add_node("temporal_aggregate", partial(_temporal_aggregate_node, toolbox=toolbox))
     builder.add_node("memory_filter", partial(_memory_filter_node, toolbox=toolbox))
 
     builder.add_edge(START, "verify")
-    builder.add_edge("verify", "memory_filter")
+    builder.add_edge("verify", "temporal_aggregate")
+    builder.add_edge("temporal_aggregate", "memory_filter")
     builder.add_edge("memory_filter", END)
 
     return builder.compile()
@@ -107,6 +114,7 @@ class DecisionAgent:
             # 降级：直接串调（兼容无 toolbox 的单测场景）
             final_state = dict(initial_state)
             final_state.update(verifier_node(final_state, self.toolbox))
+            final_state.update(temporal_aggregate_node(final_state, self.toolbox))
             final_state.update(memory_filter_node(final_state, self.toolbox))
 
         return {

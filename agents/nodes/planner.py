@@ -211,11 +211,19 @@ def compile_rule(rule: Rule, llm: LLMClient | None = None, toolbox: Toolbox | No
 
 def planner_node(state: dict, toolbox: Toolbox) -> dict:
     """规划：编译规则 + 拉取摄像头台账 + 生成 camera × rule 子任务。"""
+    from datetime import datetime
+
     rules: list[Rule] = state.get("rules", [])
     llm = get_llm_client()
 
     # 摄像头台账：优先用 state 里的，否则从 camera-registry 拉取
     cameras = state.get("cameras") or toolbox.list_cameras()
+
+    # Demo 默认巡检窗口（与 fetcher_node 保持一致）
+    now = datetime.now()
+    start_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    end_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    duration = (end_time - start_time).total_seconds()
 
     tasks: list[AnalysisTask] = []
     react_used = 0
@@ -231,6 +239,9 @@ def planner_node(state: dict, toolbox: Toolbox) -> dict:
                     camera_id=cam["id"],
                     rule=compiled,
                     clip_path=f"data/clips/{cam['id']}.mp4",
+                    clip_start_time=start_time,
+                    clip_end_time=end_time,
+                    duration_seconds=duration,
                 )
             )
 

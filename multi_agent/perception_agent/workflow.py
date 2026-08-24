@@ -51,6 +51,9 @@ def _analyze_node(state: PerceptionState) -> dict:
         camera_id=task_dict.get("camera_id", ""),
         rule=Rule(**task_dict.get("rule", {})),
         clip_path=task_dict.get("clip_path", ""),
+        clip_start_time=task_dict.get("clip_start_time"),
+        clip_end_time=task_dict.get("clip_end_time"),
+        duration_seconds=task_dict.get("duration_seconds", 0.0),
     )
 
     # 使用 Router 走三级路由（L0→L1→L2）

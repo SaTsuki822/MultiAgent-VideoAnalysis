@@ -85,20 +85,33 @@ def verifier_node(state: dict, toolbox: Toolbox) -> dict:
     settings = get_settings()
     llm = get_llm_client()
 
-    # 从 tasks 建立 rule_id -> (severity, rule_name) 映射
-    rule_meta: dict[str, tuple[str, str]] = {}
+    # 从 tasks 建立 rule_id -> (severity, rule_name, duration_threshold) 映射
+    rule_meta: dict[str, tuple[str, str, float | None]] = {}
     for t in state.get("tasks", []):
-        rule_meta[t.rule.id] = (t.rule.severity, t.rule.name)
+        if hasattr(t, "rule"):
+            rule = t.rule
+        else:
+            rule = t.get("rule", {})
+        rid = getattr(rule, "id", rule.get("id", ""))
+        severity = getattr(rule, "severity", rule.get("severity", "medium"))
+        name = getattr(rule, "name", rule.get("name", rid))
+        duration = getattr(rule, "duration_threshold_seconds", rule.get("duration_threshold_seconds"))
+        if rid:
+            rule_meta[rid] = (severity, name, duration)
 
     max_gap = settings.consecutive_hit_window / settings.base_fps
     verifications: list[Verification] = []
     alarms: list[Alarm] = []
 
     for f in findings:
-        severity, rule_name = rule_meta.get(f.rule_id, ("medium", f.rule_id))
+        severity, rule_name, duration_threshold = rule_meta.get(f.rule_id, ("medium", f.rule_id, None))
         consistent = passes_consistency(f, settings.consecutive_hit_window, max_gap)
         ver = verify_finding(f, consistent, rule_name, toolbox, llm)
         verifications.append(ver)
+
+        # 持续型异常：不在 verifier 层创建 Alarm，留给 temporal_aggregate 做时序聚合
+        if duration_threshold:
+            continue
 
         if ver.verdict == "confirmed":
             evidence = [e.model_dump() for e in f.evidence]

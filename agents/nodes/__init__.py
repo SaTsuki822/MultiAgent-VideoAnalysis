@@ -14,6 +14,7 @@ from agents.nodes import (
     planner,
     prescreen,
     reporter,
+    temporal_aggregator,
     verifier,
 )
 
@@ -26,5 +27,6 @@ __all__ = [
     "planner",
     "prescreen",
     "reporter",
+    "temporal_aggregator",
     "verifier",
 ]

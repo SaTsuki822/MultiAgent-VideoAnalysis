@@ -14,7 +14,7 @@ from __future__ import annotations
 from functools import partial
 from typing import Callable
 
-from agents.nodes import dispatcher, fetcher, hitl, memory_filter, notifier, planner, reporter, verifier
+from agents.nodes import dispatcher, fetcher, hitl, memory_filter, notifier, planner, reporter, temporal_aggregator, verifier
 from agents.state import PatrolState, merge_by_id
 from agents.toolbox import Toolbox
 
@@ -53,6 +53,7 @@ def build_graph(toolbox: Toolbox, hitl_handler: Callable | None = None, checkpoi
     builder.add_node("fetch", partial(fetcher.fetcher_node, toolbox=toolbox))
     builder.add_node("dispatch", partial(dispatcher.dispatch_node, toolbox=toolbox))
     builder.add_node("verify", partial(verifier.verifier_node, toolbox=toolbox))
+    builder.add_node("temporal_aggregate", partial(temporal_aggregator.temporal_aggregate_node, toolbox=toolbox))
     builder.add_node("memory_filter", partial(memory_filter.memory_filter_node, toolbox=toolbox))
     builder.add_node("hitl", partial(hitl.hitl_node, toolbox=toolbox, hitl_handler=hitl_handler or _interrupt_handler))
     builder.add_node("report", partial(reporter.reporter_node, toolbox=toolbox))
@@ -62,7 +63,8 @@ def build_graph(toolbox: Toolbox, hitl_handler: Callable | None = None, checkpoi
     builder.add_edge("plan", "fetch")
     builder.add_edge("fetch", "dispatch")
     builder.add_edge("dispatch", "verify")
-    builder.add_edge("verify", "memory_filter")
+    builder.add_edge("verify", "temporal_aggregate")
+    builder.add_edge("temporal_aggregate", "memory_filter")
     builder.add_edge("memory_filter", "hitl")
     builder.add_edge("hitl", "report")
     builder.add_edge("report", "notify")
@@ -79,6 +81,7 @@ def run_pipeline(initial_state: dict, toolbox: Toolbox, hitl_handler: Callable |
         partial(fetcher.fetcher_node, toolbox=toolbox),
         partial(dispatcher.dispatch_node, toolbox=toolbox),
         partial(verifier.verifier_node, toolbox=toolbox),
+        partial(temporal_aggregator.temporal_aggregate_node, toolbox=toolbox),
         partial(memory_filter.memory_filter_node, toolbox=toolbox),
         partial(hitl.hitl_node, toolbox=toolbox, hitl_handler=hitl_handler),
         partial(reporter.reporter_node, toolbox=toolbox),

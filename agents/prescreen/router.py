@@ -104,5 +104,9 @@ class Router:
             hit_frame_indices=[e.frame_index for e in hit_evidence],
             cost_tokens=breakdown.total_tokens,
             cost_currency=breakdown.total_cost,
+            # 带入绝对时间信息，供下游时序聚合使用
+            clip_start_time=task.clip_start_time,
+            clip_end_time=task.clip_end_time,
+            duration_seconds=task.duration_seconds,
         )
         return finding, breakdown
