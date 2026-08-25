@@ -24,6 +24,17 @@ from typing import Any
 
 from a2a_protocol.message_schema import A2AMessage, A2AResult
 from a2a_protocol.redis_stream import RedisStreamClient
+from multi_agent.orchestrator.patrol_state_store import (
+    STAGE_CREATED,
+    STAGE_DISPATCHED,
+    STAGE_DONE,
+    STAGE_EXECUTED,
+    STAGE_FAILED,
+    STAGE_PLANNED,
+    STAGE_VERIFIED,
+    PatrolCheckpoint,
+    RedisPatrolStateStore,
+)
 
 
 class LoadBalancer:
@@ -116,12 +127,18 @@ class Orchestrator:
         perception_agents: list[str] | None = None,
         redis_client=None,
         agent_spawner=None,
+        patrol_store=None,
     ):
         self.planner_url = planner_url
         self.decision_url = decision_url
         self.action_url = action_url
         self.load_balancer = LoadBalancer(perception_agents or ["perception-1"])
         self.redis = RedisStreamClient(redis_client=redis_client)
+
+        # 状态持久化：默认复用同一 Redis 连接做 checkpoint；也可注入 mock store（测试）
+        self.patrol_store = (
+            patrol_store if patrol_store is not None else RedisPatrolStateStore(self.redis.r)
+        )
 
         # 自动扩缩容：仅当显式注入 agent_spawner 时才构建（默认关闭）
         self.autoscaler = None
@@ -220,44 +237,102 @@ class Orchestrator:
 
     # ---- 完整巡检流程 ----
 
-    def run_patrol(self, rules: list[dict], cameras: list[dict]) -> dict:
-        """端到端巡检：协调 Agent 编排全流程。"""
-        patrol_id = f"patrol_{uuid.uuid4().hex[:8]}"
-        print(f"[Orchestrator] 启动巡检 {patrol_id}，规则={len(rules)} 摄像头={len(cameras)}")
+    def _save_checkpoint(self, cp: PatrolCheckpoint):
+        """持久化巡检快照；store 缺失或写失败时不中断主流程。"""
+        if self.patrol_store is None:
+            return
+        self.patrol_store.save(cp)
+
+    def _run_from_checkpoint(self, cp: PatrolCheckpoint) -> dict:
+        """从 cp.stage 之后继续执行剩余阶段，返回最终结果。
+
+        线性级联：每完成一个阶段就把 cp.stage 前推，后续 if 条件基于最新 stage 判断；
+        resume 时只有「已持久化阶段之后」的 if 会命中，前面已完成的阶段被自然跳过。
+        """
+        patrol_id = cp.patrol_id
 
         # Step 1: 规划 Agent 生成子任务
-        plan_res = self._call_sync(self.planner_url, "plan", {"rules": rules, "cameras": cameras})
-        if plan_res.get("status") == "error":
-            return {"patrol_id": patrol_id, "status": "failed", "stage": "plan", "error": plan_res.get("error")}
-        sub_tasks = plan_res.get("result", {}).get("tasks", [])
+        if cp.stage == STAGE_CREATED:
+            plan_res = self._call_sync(self.planner_url, "plan", {"rules": cp.rules, "cameras": cp.cameras})
+            if plan_res.get("status") == "error":
+                cp.status = STAGE_FAILED
+                cp.error = plan_res.get("error")
+                self._save_checkpoint(cp)
+                return {"patrol_id": patrol_id, "status": "failed", "stage": "plan", "error": plan_res.get("error")}
+            cp.sub_tasks = plan_res.get("result", {}).get("tasks", [])
+            cp.stage = STAGE_PLANNED
+            self._save_checkpoint(cp)
 
         # Step 2: 分发给感知 Agent（Map）
-        perception_results = self.dispatch_to_perception(sub_tasks)
-        findings = []
-        for res in perception_results:
-            if res.status == "success":
-                findings.extend(res.result.get("findings", []))
+        if cp.stage == STAGE_PLANNED:
+            perception_results = self.dispatch_to_perception(cp.sub_tasks)
+            cp.findings = []
+            for res in perception_results:
+                if res.status == "success":
+                    cp.findings.extend(res.result.get("findings", []))
+            cp.stage = STAGE_DISPATCHED
+            self._save_checkpoint(cp)
 
         # Step 3: 决策 Agent 复核
-        decision_res = self._call_sync(
-            self.decision_url,
-            "verify",
-            {"findings": findings, "tasks": sub_tasks},
-        )
-        alarms = decision_res.get("result", {}).get("alarms", [])
+        if cp.stage == STAGE_DISPATCHED:
+            decision_res = self._call_sync(
+                self.decision_url,
+                "verify",
+                {"findings": cp.findings, "tasks": cp.sub_tasks},
+            )
+            cp.alarms = decision_res.get("result", {}).get("alarms", [])
+            cp.stage = STAGE_VERIFIED
+            self._save_checkpoint(cp)
 
         # Step 4: 执行 Agent 落地（告警、工单、报告）
-        action_res = self._call_sync(
-            self.action_url,
-            "execute",
-            {"alarms": alarms, "patrol_id": patrol_id},
-        )
+        if cp.stage == STAGE_VERIFIED:
+            action_res = self._call_sync(
+                self.action_url,
+                "execute",
+                {"alarms": cp.alarms, "patrol_id": patrol_id},
+            )
+            cp.action_result = action_res.get("result", {})
+            cp.stage = STAGE_EXECUTED
+            cp.status = STAGE_DONE
+            self._save_checkpoint(cp)
 
         return {
             "patrol_id": patrol_id,
             "status": "success",
-            "tasks_total": len(sub_tasks),
-            "findings": len(findings),
-            "alarms": len(alarms),
-            "action": action_res.get("result", {}),
+            "tasks_total": len(cp.sub_tasks),
+            "findings": len(cp.findings),
+            "alarms": len(cp.alarms),
+            "action": cp.action_result or {},
         }
+
+    def run_patrol(self, rules: list[dict], cameras: list[dict]) -> dict:
+        """端到端巡检：协调 Agent 编排全流程，并按阶段持久化 checkpoint。"""
+        patrol_id = f"patrol_{uuid.uuid4().hex[:8]}"
+        print(f"[Orchestrator] 启动巡检 {patrol_id}，规则={len(rules)} 摄像头={len(cameras)}")
+
+        cp = PatrolCheckpoint(patrol_id=patrol_id, rules=rules, cameras=cameras)
+        self._save_checkpoint(cp)
+        return self._run_from_checkpoint(cp)
+
+    def resume_patrol(self, patrol_id: str) -> dict:
+        """从最近一次 checkpoint 续跑未完成阶段。
+
+        诚实边界：若 checkpoint 停在 dispatch 之后（findings 已部分收集），重跑会重新
+        dispatch 感知任务（重发消息，非 exactly-once），可能重复分析已完成的片段；
+        完整幂等续跑（按 message_id 跳过已 ACK 任务）是 TODO。
+        """
+        if self.patrol_store is None:
+            return {"patrol_id": patrol_id, "status": "error", "error": "未配置状态持久化"}
+        cp = self.patrol_store.load(patrol_id)
+        if cp is None:
+            return {"patrol_id": patrol_id, "status": "error", "error": "checkpoint 不存在"}
+        if cp.status == STAGE_DONE:
+            return {
+                "patrol_id": patrol_id,
+                "status": "success",
+                "tasks_total": len(cp.sub_tasks),
+                "findings": len(cp.findings),
+                "alarms": len(cp.alarms),
+                "action": cp.action_result or {},
+            }
+        return self._run_from_checkpoint(cp)
