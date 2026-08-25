@@ -43,7 +43,9 @@ class RedisStreamClient:
         msg_dict = message.to_dict()
         # Redis Stream 的 xadd 要求 value 为字符串
         entry = {k: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v) for k, v in msg_dict.items()}
-        msg_id = self.r.xadd(self.stream_name, entry)
+        # maxlen 近似裁剪作为安全网：正常情况下任务完成即被 ack_task 内 XDEL 移除，
+        # maxlen 兜底防止异常未确认消息无限堆积。
+        msg_id = self.r.xadd(self.stream_name, entry, maxlen=100000, approximate=True)
         return msg_id
 
     def broadcast_task(self, messages: list[A2AMessage]) -> list[str]:
@@ -51,7 +53,7 @@ class RedisStreamClient:
         pipe = self.r.pipeline()
         for msg in messages:
             entry = {k: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v) for k, v in msg.to_dict().items()}
-            pipe.xadd(self.stream_name, entry)
+            pipe.xadd(self.stream_name, entry, maxlen=100000, approximate=True)
         return pipe.execute()
 
     # ---- 消费者 API（感知 Agent 用）----
@@ -95,8 +97,25 @@ class RedisStreamClient:
         return results
 
     def ack_task(self, stream_id: str):
-        """确认任务已完成。"""
+        """确认任务已完成，并将消息从任务流移除。
+
+        XACK 把消息从消费者组 PEL 移除；XDEL 再把消息从 Stream 本体删除，
+        使 `task_backlog()` 的 XLEN 精确等于「已发送但尚未完成」的任务数，
+        供自动扩缩容判断积压量使用。
+        """
         self.r.xack(self.stream_name, self.group_name, stream_id)
+        self.r.xdel(self.stream_name, stream_id)
+
+    def task_backlog(self) -> int:
+        """待处理任务数 = 任务流当前长度（XLEN）。
+
+        语义：send_task 写入、ack_task 后 XDEL 移除，因此 XLEN 精确等于「已发送未完成」。
+        若消息由外部直接 xadd 且未走 ack_task 裁剪，则退化为「流总长度」的近似语义。
+        """
+        try:
+            return int(self.r.xlen(self.stream_name))
+        except Exception:
+            return 0
 
     def get_pending(self, consumer_name: str) -> list[tuple[str, str, int, int]]:
         """获取本消费者的 PEL（未确认任务）。

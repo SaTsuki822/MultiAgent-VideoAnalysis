@@ -54,6 +54,15 @@ class Settings:
     # ---- 并发 ----
     max_concurrency: int = 4           # dispatch 并发上限（受 GPU 显存 / API 限流约束）
 
+    # ---- 自动扩缩容（路径 A：自研轻量 autoscaler，见 multi_agent/orchestrator/autoscaler.py）----
+    autoscaler_enabled: bool = False           # 是否启用（默认关，需显式开启）
+    autoscaler_min_instances: int = 1          # 最小感知 Agent 实例数
+    autoscaler_max_instances: int = 4          # 最大感知 Agent 实例数（受 GPU 供给约束）
+    autoscaler_scale_up_backlog: int = 4       # 积压 >= 该值则扩容
+    autoscaler_scale_down_backlog: int = 0     # 积压 <= 该值则缩容
+    autoscaler_poll_interval_sec: float = 5.0  # 采样间隔（秒）
+    autoscaler_cooldown_sec: float = 10.0      # 扩缩容冷却窗口（秒，防抖）
+
     # ---- 路径 ----
     data_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data")
 

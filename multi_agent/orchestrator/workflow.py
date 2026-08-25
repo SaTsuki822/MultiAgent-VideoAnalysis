@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -114,12 +115,21 @@ class Orchestrator:
         action_url: str = "http://localhost:8004",
         perception_agents: list[str] | None = None,
         redis_client=None,
+        agent_spawner=None,
     ):
         self.planner_url = planner_url
         self.decision_url = decision_url
         self.action_url = action_url
         self.load_balancer = LoadBalancer(perception_agents or ["perception-1"])
         self.redis = RedisStreamClient(redis_client=redis_client)
+
+        # 自动扩缩容：仅当显式注入 agent_spawner 时才构建（默认关闭）
+        self.autoscaler = None
+        if agent_spawner is not None:
+            from agents.config import get_settings
+            from multi_agent.orchestrator.autoscaler import Autoscaler
+
+            self.autoscaler = Autoscaler(self.redis, self.load_balancer, agent_spawner, get_settings())
 
     # ---- 同步调用：规划 Agent / 决策 Agent / 执行 Agent ----
 
@@ -194,6 +204,19 @@ class Orchestrator:
             )
 
         return results
+
+    # ---- 自动扩缩容 ----
+
+    def start_autoscaler(self):
+        """后台线程运行自动扩缩容（需在巡检前启动）。
+
+        返回后台线程；调用方需先注入 agent_spawner（见 __init__）。
+        """
+        if self.autoscaler is None:
+            raise RuntimeError("未提供 agent_spawner，无法启动自动扩缩容")
+        t = threading.Thread(target=self.autoscaler.run, daemon=True)
+        t.start()
+        return t
 
     # ---- 完整巡检流程 ----
 
