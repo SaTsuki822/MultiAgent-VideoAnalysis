@@ -30,6 +30,7 @@ from multi_agent.orchestrator.patrol_state_store import (
     STAGE_DONE,
     STAGE_EXECUTED,
     STAGE_FAILED,
+    STAGE_HITL,
     STAGE_PLANNED,
     STAGE_VERIFIED,
     PatrolCheckpoint,
@@ -281,15 +282,33 @@ class Orchestrator:
                 {"findings": cp.findings, "tasks": cp.sub_tasks},
             )
             cp.alarms = decision_res.get("result", {}).get("alarms", [])
+            cp.pending_review = decision_res.get("result", {}).get("pending_review", [])
             cp.stage = STAGE_VERIFIED
             self._save_checkpoint(cp)
 
         # Step 4: 执行 Agent 落地（告警、工单、报告）
-        if cp.stage == STAGE_VERIFIED:
+        # HITL 闭环：决策 Agent 分流的 pending_review 非空时，先停在 hitl 阶段等人工提交决策；
+        # 人工回填后（hitl_decisions 由 None 变为列表，可为空列表）再交给执行 Agent 应用并落地。
+        if cp.stage in (STAGE_VERIFIED, STAGE_HITL):
+            if cp.pending_review and cp.hitl_decisions is None:
+                cp.stage = STAGE_HITL
+                self._save_checkpoint(cp)
+                return {
+                    "patrol_id": patrol_id,
+                    "status": "waiting_hitl",
+                    "stage": STAGE_HITL,
+                    "alarms": cp.alarms,
+                    "pending_review": cp.pending_review,
+                }
             action_res = self._call_sync(
                 self.action_url,
                 "execute",
-                {"alarms": cp.alarms, "patrol_id": patrol_id},
+                {
+                    "alarms": cp.alarms,
+                    "pending_review": cp.pending_review,
+                    "hitl_decisions": cp.hitl_decisions,
+                    "patrol_id": patrol_id,
+                },
             )
             cp.action_result = action_res.get("result", {})
             cp.stage = STAGE_EXECUTED
@@ -335,4 +354,26 @@ class Orchestrator:
                 "alarms": len(cp.alarms),
                 "action": cp.action_result or {},
             }
+        return self._run_from_checkpoint(cp)
+
+    def submit_hitl_decisions(self, patrol_id: str, decisions: list[dict]) -> dict:
+        """HITL 闭环的「人工回填」入口：提交人工复核决策后继续执行 Agent 落地。
+
+        前置条件：checkpoint 停在 STAGE_HITL（有 pending_review 且尚未提交决策）。
+        decisions 为空列表表示「人工已复核、无需任何处置」，仍会推进到执行阶段；
+        与 None（尚未提交）严格区分。
+        """
+        if self.patrol_store is None:
+            return {"patrol_id": patrol_id, "status": "error", "error": "未配置状态持久化"}
+        cp = self.patrol_store.load(patrol_id)
+        if cp is None:
+            return {"patrol_id": patrol_id, "status": "error", "error": "checkpoint 不存在"}
+        if cp.stage != STAGE_HITL:
+            return {
+                "patrol_id": patrol_id,
+                "status": "error",
+                "error": f"当前阶段 {cp.stage} 非 hitl，无需提交人工决策",
+            }
+        cp.hitl_decisions = list(decisions)
+        self._save_checkpoint(cp)
         return self._run_from_checkpoint(cp)

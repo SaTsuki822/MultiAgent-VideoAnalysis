@@ -8,7 +8,7 @@
 设计要点（对应面试「协调器状态持久化 / 单一事实源」）：
 - key 约定：`guardeye:patrol:{patrol_id}`（JSON 序列化巡检上下文），
   另有 `guardeye:patrols`（SET）记录所有 patrol_id 供 list_active；
-- 阶段常量：created → planned → dispatched → verified → executed → done（failed 表示失败）；
+- 阶段常量：created → planned → dispatched → verified → hitl → executed → done（failed 表示失败）；
 - 诚实边界：resume 重跑会重发感知任务（非 exactly-once），仅适合 Demo；完整幂等续跑是 TODO。
 """
 
@@ -26,6 +26,7 @@ STAGE_CREATED = "created"        # 已创建，尚未规划
 STAGE_PLANNED = "planned"        # 规划 Agent 已产出子任务
 STAGE_DISPATCHED = "dispatched"  # 感知 Agent 已返回 findings
 STAGE_VERIFIED = "verified"      # 决策 Agent 已产出 alarms
+STAGE_HITL = "hitl"              # 有待复核告警，等待人工提交决策
 STAGE_EXECUTED = "executed"      # 执行 Agent 已落地
 STAGE_DONE = "done"              # 全流程完成
 STAGE_FAILED = "failed"          # 失败（stage 字段记录失败在哪个阶段）
@@ -43,6 +44,8 @@ class PatrolCheckpoint:
     sub_tasks: list[dict] = field(default_factory=list)
     findings: list[dict] = field(default_factory=list)
     alarms: list[dict] = field(default_factory=list)
+    pending_review: list[dict] = field(default_factory=list)
+    hitl_decisions: list[dict] | None = None
     action_result: dict | None = None
     error: str | None = None
     created_at: float = field(default_factory=time.time)
@@ -62,6 +65,8 @@ class PatrolCheckpoint:
             sub_tasks=data.get("sub_tasks", []),
             findings=data.get("findings", []),
             alarms=data.get("alarms", []),
+            pending_review=data.get("pending_review", []),
+            hitl_decisions=data.get("hitl_decisions"),
             action_result=data.get("action_result"),
             error=data.get("error"),
             created_at=data.get("created_at", 0.0),

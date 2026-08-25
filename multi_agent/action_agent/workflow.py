@@ -92,13 +92,24 @@ class ActionAgent:
         self._graph = build_action_graph(toolbox) if toolbox else None
 
     def execute(
-        self, alarms: list[dict], patrol_id: str, hitl_decisions: list[dict] | None = None
+        self,
+        alarms: list[dict],
+        patrol_id: str,
+        hitl_decisions: list[dict] | None = None,
+        pending_review: list[dict] | None = None,
     ) -> dict:
-        """执行业务动作（通过 LangGraph 子图）。"""
+        """执行业务动作（通过 LangGraph 子图）。
+
+        pending_review：决策 Agent 分流出的「待人工复核」告警（未命中误报抑制的告警）；
+        若未显式传入（旧调用），回退到全部 alarms，保证无 HITL 分隔时也能跑通。
+        """
         alarm_objs = [Alarm(**a) for a in alarms]
+        pending_objs = (
+            [Alarm(**a) for a in pending_review] if pending_review is not None else alarm_objs
+        )
         initial_state: ActionState = {
             "alarms": alarm_objs,
-            "pending_review": alarm_objs,
+            "pending_review": pending_objs,
             "patrol_id": patrol_id,
             "hitl_decisions": hitl_decisions,
         }
@@ -128,6 +139,7 @@ class ActionAgent:
                     payload.get("alarms", []),
                     payload.get("patrol_id", ""),
                     payload.get("hitl_decisions"),
+                    payload.get("pending_review"),
                 ),
             }
         return {"status": "error", "error": f"未知任务: {task}"}
