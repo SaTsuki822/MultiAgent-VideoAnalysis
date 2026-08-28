@@ -36,6 +36,11 @@ from multi_agent.orchestrator.patrol_state_store import (
     PatrolCheckpoint,
     RedisPatrolStateStore,
 )
+from multi_agent.orchestrator.exception_handler import (
+    L0L1ExceptionHandler,
+    make_exception_event,
+    ExceptionDecision,
+)
 
 
 class LoadBalancer:
@@ -141,6 +146,16 @@ class Orchestrator:
             patrol_store if patrol_store is not None else RedisPatrolStateStore(self.redis.r)
         )
 
+        # Phase 1+2：结构化异常处理引擎（可选 LLM 顾问）
+        from agents.config import get_settings
+        settings = get_settings()
+        if settings.exception_llm_advisor_enabled:
+            from multi_agent.orchestrator.exception_handler import LLMExceptionAdvisor
+            advisor = LLMExceptionAdvisor()
+            self._exc_handler = L0L1ExceptionHandler(llm_advisor=advisor)
+        else:
+            self._exc_handler = L0L1ExceptionHandler()
+
         # 自动扩缩容：仅当显式注入 agent_spawner 时才构建（默认关闭）
         self.autoscaler = None
         if agent_spawner is not None:
@@ -149,12 +164,112 @@ class Orchestrator:
 
             self.autoscaler = Autoscaler(self.redis, self.load_balancer, agent_spawner, get_settings())
 
-    # ---- 同步调用：规划 Agent / 决策 Agent / 执行 Agent ----
+    # ---- Phase 1：统一异常处理入口 ----
+
+    def _handle_stage_error(
+        self,
+        cp: PatrolCheckpoint,
+        source_agent: str,
+        error_message: str,
+        source_agent_id: str = "",
+        context: dict | None = None,
+    ) -> ExceptionDecision:
+        """统一异常处理入口：构造事件 → 分类 → 决策 → 记录到 checkpoint → 返回决策。"""
+        event = make_exception_event(
+            patrol_id=cp.patrol_id,
+            source_agent=source_agent,
+            error_message=error_message,
+            stage=cp.stage,
+            source_agent_id=source_agent_id,
+            context=context or {},
+        )
+        event = self._exc_handler.handle(event)
+        cp.exception_log.append(event.to_dict())
+        self._save_checkpoint(cp)
+        return event.final_decision
+
+    def _escalate_to_hitl(self, cp: PatrolCheckpoint) -> dict:
+        """Phase 3：将 ESCALATE 决策转为 HITL 人工复核。
+
+        从 cp.exception_log 最后一条提取异常上下文，写入 exception_review，
+        将 checkpoint 停在 STAGE_HITL，等待人工确认后再执行最终动作。
+        """
+        last_event = cp.exception_log[-1] if cp.exception_log else {}
+        cp.exception_review = [
+            {
+                "event_id": last_event.get("event_id", ""),
+                "stage": cp.stage,
+                "source_agent": last_event.get("source_agent", ""),
+                "error_message": last_event.get("error_message", ""),
+                "llm_reason": last_event.get("final_reason", ""),
+                "proposed_decision": last_event.get("final_decision", ""),
+            }
+        ]
+        cp.stage = STAGE_HITL
+        self._save_checkpoint(cp)
+        return {
+            "patrol_id": cp.patrol_id,
+            "status": "waiting_hitl",
+            "stage": STAGE_HITL,
+            "exception_review": cp.exception_review,
+        }
+
+    def _call_sync_with_retry(
+        self,
+        cp: PatrolCheckpoint,
+        url: str,
+        task: str,
+        payload: dict,
+        source_agent: str,
+        max_retries: int = 2,
+    ) -> dict:
+        """同步调用其他 Agent，内置重试 + 异常处理。
+
+        流程：
+        1. 发起调用；
+        2. 失败时调用异常处理引擎，若决策为 RETRY 则继续；
+        3. 达到 max_retries 或决策非 RETRY 时，返回最终错误结果。
+        """
+        last_error = ""
+        for attempt in range(max_retries + 1):
+            try:
+                import requests
+                resp = requests.post(
+                    f"{url}/run",
+                    json={"task": task, "payload": payload},
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                # 业务层错误（status=error）也视为需要处理的异常
+                if result.get("status") != "error":
+                    return result
+                last_error = result.get("error", "unknown error")
+            except Exception as e:
+                last_error = str(e)
+
+            # 最后一次尝试不需要再决策，直接返回错误
+            if attempt >= max_retries:
+                break
+
+            # 调用异常处理引擎
+            decision = self._handle_stage_error(
+                cp,
+                source_agent,
+                last_error,
+                context={"retry_count": attempt, "max_retries": max_retries},
+            )
+            if decision != ExceptionDecision.RETRY:
+                # 非 RETRY 决策：直接返回错误，由上层根据决策处理
+                break
+
+        return {"status": "error", "error": last_error}
+
+    # ---- 同步调用：规划 Agent / 决策 Agent / 执行 Agent（保留原方法兼容，内部改用 with_retry） ----
 
     def _call_sync(self, url: str, task: str, payload: dict) -> dict:
-        """同步 HTTP 调用其他 Agent（规划、决策、执行）。"""
+        """原始同步调用（无重试）。供无需异常处理的场景使用。"""
         import requests
-
         try:
             resp = requests.post(f"{url}/run", json={"task": task, "payload": payload}, timeout=60)
             resp.raise_for_status()
@@ -249,20 +364,55 @@ class Orchestrator:
 
         线性级联：每完成一个阶段就把 cp.stage 前推，后续 if 条件基于最新 stage 判断；
         resume 时只有「已持久化阶段之后」的 if 会命中，前面已完成的阶段被自然跳过。
+
+        Phase 1 改进：
+        - 各阶段错误统一走 _call_sync_with_retry（内置重试 + 异常处理）；
+        - 感知 Agent 的单个任务失败走结构化异常处理（SKIP_TASK / ABORT）；
+        - 所有异常事件记录到 cp.exception_log，为 Phase 2 LLM 决策积累上下文。
         """
         patrol_id = cp.patrol_id
 
         # Step 1: 规划 Agent 生成子任务
         if cp.stage == STAGE_CREATED:
-            plan_res = self._call_sync(self.planner_url, "plan", {"rules": cp.rules, "cameras": cp.cameras})
+            plan_res = self._call_sync_with_retry(
+                cp,
+                self.planner_url,
+                "plan",
+                {"rules": cp.rules, "cameras": cp.cameras},
+                source_agent="planner",
+                max_retries=2,
+            )
             if plan_res.get("status") == "error":
-                cp.status = STAGE_FAILED
-                cp.error = plan_res.get("error")
+                # 重试耗尽或策略决策非 RETRY，进入最终错误处理
+                final_decision = self._handle_stage_error(
+                    cp,
+                    "planner",
+                    plan_res.get("error", ""),
+                    context={"rules_count": len(cp.rules)},
+                )
+                if final_decision == ExceptionDecision.SKIP_STAGE:
+                    # 规划异常但允许跳过：生成空任务列表，继续后续流程
+                    cp.sub_tasks = []
+                    cp.stage = STAGE_PLANNED
+                    self._save_checkpoint(cp)
+                elif final_decision == ExceptionDecision.ESCALATE:
+                    # Phase 3：安全关键异常触发 HITL 人工复核
+                    return self._escalate_to_hitl(cp)
+                else:
+                    cp.status = STAGE_FAILED
+                    cp.error = plan_res.get("error")
+                    self._save_checkpoint(cp)
+                    return {
+                        "patrol_id": patrol_id,
+                        "status": "failed",
+                        "stage": "plan",
+                        "error": plan_res.get("error"),
+                        "decision": final_decision.value,
+                    }
+            else:
+                cp.sub_tasks = plan_res.get("result", {}).get("tasks", [])
+                cp.stage = STAGE_PLANNED
                 self._save_checkpoint(cp)
-                return {"patrol_id": patrol_id, "status": "failed", "stage": "plan", "error": plan_res.get("error")}
-            cp.sub_tasks = plan_res.get("result", {}).get("tasks", [])
-            cp.stage = STAGE_PLANNED
-            self._save_checkpoint(cp)
 
         # Step 2: 分发给感知 Agent（Map）
         if cp.stage == STAGE_PLANNED:
@@ -271,16 +421,68 @@ class Orchestrator:
             for res in perception_results:
                 if res.status == "success":
                     cp.findings.extend(res.result.get("findings", []))
+                elif res.status in ("error", "timeout"):
+                    # Phase 1：单个感知任务异常 → 结构化异常处理
+                    decision = self._handle_stage_error(
+                        cp,
+                        "perception",
+                        res.error or f"status={res.status}",
+                        source_agent_id=res.from_agent,
+                        context={
+                            "task_id": res.message_id,
+                            "total_tasks": len(cp.sub_tasks),
+                        },
+                    )
+                    if decision == ExceptionDecision.ABORT:
+                        cp.status = STAGE_FAILED
+                        cp.error = f"感知Agent {res.from_agent} 异常且决策为ABORT: {res.error}"
+                        self._save_checkpoint(cp)
+                        return {
+                            "patrol_id": patrol_id,
+                            "status": "failed",
+                            "stage": "dispatch",
+                            "error": cp.error,
+                        }
+                    if decision == ExceptionDecision.ESCALATE:
+                        # Phase 3：安全关键异常触发 HITL 人工复核
+                        return self._escalate_to_hitl(cp)
+                    # SKIP_TASK / IGNORE：继续，不收集该任务的结果
             cp.stage = STAGE_DISPATCHED
             self._save_checkpoint(cp)
 
         # Step 3: 决策 Agent 复核
         if cp.stage == STAGE_DISPATCHED:
-            decision_res = self._call_sync(
+            decision_res = self._call_sync_with_retry(
+                cp,
                 self.decision_url,
                 "verify",
                 {"findings": cp.findings, "tasks": cp.sub_tasks},
+                source_agent="decision",
+                max_retries=2,
             )
+            if decision_res.get("status") == "error":
+                final_decision = self._handle_stage_error(
+                    cp,
+                    "decision",
+                    decision_res.get("error", ""),
+                    context={
+                        "findings_count": len(cp.findings),
+                        "tasks_count": len(cp.sub_tasks),
+                    },
+                )
+                if final_decision == ExceptionDecision.ESCALATE:
+                    # Phase 3：安全关键异常触发 HITL 人工复核
+                    return self._escalate_to_hitl(cp)
+                cp.status = STAGE_FAILED
+                cp.error = decision_res.get("error")
+                self._save_checkpoint(cp)
+                return {
+                    "patrol_id": patrol_id,
+                    "status": "failed",
+                    "stage": "decision",
+                    "error": decision_res.get("error"),
+                    "decision": final_decision.value,
+                }
             cp.alarms = decision_res.get("result", {}).get("alarms", [])
             cp.pending_review = decision_res.get("result", {}).get("pending_review", [])
             cp.stage = STAGE_VERIFIED
@@ -289,7 +491,18 @@ class Orchestrator:
         # Step 4: 执行 Agent 落地（告警、工单、报告）
         # HITL 闭环：决策 Agent 分流的 pending_review 非空时，先停在 hitl 阶段等人工提交决策；
         # 人工回填后（hitl_decisions 由 None 变为列表，可为空列表）再交给执行 Agent 应用并落地。
+        # Phase 3：安全关键异常（ESCALATE）同样触发 HITL，等待人工确认后才真正执行。
         if cp.stage in (STAGE_VERIFIED, STAGE_HITL):
+            # Phase 3：优先处理异常复核（安全关键）
+            if cp.exception_review and cp.exception_hitl_decisions is None:
+                cp.stage = STAGE_HITL
+                self._save_checkpoint(cp)
+                return {
+                    "patrol_id": patrol_id,
+                    "status": "waiting_hitl",
+                    "stage": STAGE_HITL,
+                    "exception_review": cp.exception_review,
+                }
             if cp.pending_review and cp.hitl_decisions is None:
                 cp.stage = STAGE_HITL
                 self._save_checkpoint(cp)
@@ -300,7 +513,8 @@ class Orchestrator:
                     "alarms": cp.alarms,
                     "pending_review": cp.pending_review,
                 }
-            action_res = self._call_sync(
+            action_res = self._call_sync_with_retry(
+                cp,
                 self.action_url,
                 "execute",
                 {
@@ -309,7 +523,29 @@ class Orchestrator:
                     "hitl_decisions": cp.hitl_decisions,
                     "patrol_id": patrol_id,
                 },
+                source_agent="action",
+                max_retries=2,
             )
+            if action_res.get("status") == "error":
+                final_decision = self._handle_stage_error(
+                    cp,
+                    "action",
+                    action_res.get("error", ""),
+                    context={"alarms_count": len(cp.alarms)},
+                )
+                if final_decision == ExceptionDecision.ESCALATE:
+                    # Phase 3：安全关键异常触发 HITL 人工复核
+                    return self._escalate_to_hitl(cp)
+                cp.status = STAGE_FAILED
+                cp.error = action_res.get("error")
+                self._save_checkpoint(cp)
+                return {
+                    "patrol_id": patrol_id,
+                    "status": "failed",
+                    "stage": "action",
+                    "error": action_res.get("error"),
+                    "decision": final_decision.value,
+                }
             cp.action_result = action_res.get("result", {})
             cp.stage = STAGE_EXECUTED
             cp.status = STAGE_DONE
@@ -359,9 +595,11 @@ class Orchestrator:
     def submit_hitl_decisions(self, patrol_id: str, decisions: list[dict]) -> dict:
         """HITL 闭环的「人工回填」入口：提交人工复核决策后继续执行 Agent 落地。
 
-        前置条件：checkpoint 停在 STAGE_HITL（有 pending_review 且尚未提交决策）。
+        前置条件：checkpoint 停在 STAGE_HITL（有 pending_review 或 exception_review 且尚未提交决策）。
         decisions 为空列表表示「人工已复核、无需任何处置」，仍会推进到执行阶段；
         与 None（尚未提交）严格区分。
+
+        Phase 3 扩展：支持异常复核决策（exception_event_id 字段标识）。
         """
         if self.patrol_store is None:
             return {"patrol_id": patrol_id, "status": "error", "error": "未配置状态持久化"}
@@ -374,6 +612,64 @@ class Orchestrator:
                 "status": "error",
                 "error": f"当前阶段 {cp.stage} 非 hitl，无需提交人工决策",
             }
-        cp.hitl_decisions = list(decisions)
+
+        # Phase 3：分离异常复核决策与告警复核决策
+        exc_decisions = [d for d in decisions if d.get("exception_event_id")]
+        alarm_decisions = [d for d in decisions if not d.get("exception_event_id")]
+
+        if cp.exception_review and cp.exception_hitl_decisions is None and exc_decisions:
+            cp.exception_hitl_decisions = exc_decisions
+            self._save_checkpoint(cp)
+            # 应用异常决策：abort / retry / skip
+            for d in exc_decisions:
+                decision = d.get("decision", "").lower()
+                if decision == "abort":
+                    cp.status = STAGE_FAILED
+                    cp.error = f"人工确认中断: {d.get('reason', '')}"
+                    cp.exception_review = []
+                    cp.exception_hitl_decisions = None
+                    self._save_checkpoint(cp)
+                    return {
+                        "patrol_id": patrol_id,
+                        "status": "failed",
+                        "stage": "exception_hitl",
+                        "error": cp.error,
+                    }
+                elif decision == "retry":
+                    cp.exception_review = []
+                    cp.exception_hitl_decisions = None
+                    # 恢复到异常发生时的 stage 重新执行
+                    cp.stage = d.get("stage", STAGE_CREATED)
+                    self._save_checkpoint(cp)
+                    return self._run_from_checkpoint(cp)
+                elif decision == "skip":
+                    cp.exception_review = []
+                    cp.exception_hitl_decisions = None
+                    # 跳过当前阶段：将 stage 推进到下一阶段
+                    current_stage = d.get("stage", STAGE_CREATED)
+                    if current_stage == STAGE_CREATED:
+                        cp.sub_tasks = []
+                        cp.stage = STAGE_PLANNED
+                    elif current_stage == STAGE_PLANNED:
+                        cp.findings = []
+                        cp.stage = STAGE_DISPATCHED
+                    elif current_stage == STAGE_DISPATCHED:
+                        cp.alarms = []
+                        cp.pending_review = []
+                        cp.stage = STAGE_VERIFIED
+                    elif current_stage == STAGE_VERIFIED:
+                        cp.stage = STAGE_EXECUTED
+                    self._save_checkpoint(cp)
+                    return self._run_from_checkpoint(cp)
+            # 未识别的异常决策：保持等待（理论上不会发生）
+            return {
+                "patrol_id": patrol_id,
+                "status": "waiting_hitl",
+                "stage": STAGE_HITL,
+                "exception_review": cp.exception_review,
+            }
+
+        # 原有告警复核逻辑
+        cp.hitl_decisions = list(alarm_decisions)
         self._save_checkpoint(cp)
         return self._run_from_checkpoint(cp)

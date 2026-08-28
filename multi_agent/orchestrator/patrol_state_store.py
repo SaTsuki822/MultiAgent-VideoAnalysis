@@ -48,6 +48,11 @@ class PatrolCheckpoint:
     hitl_decisions: list[dict] | None = None
     action_result: dict | None = None
     error: str | None = None
+    # Phase 1：结构化异常日志（为 Phase 2 LLM 决策积累上下文）
+    exception_log: list[dict] = field(default_factory=list)
+    # Phase 3：安全关键异常的人工复核（ESCALATE → HITL）
+    exception_review: list[dict] = field(default_factory=list)
+    exception_hitl_decisions: list[dict] | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -69,6 +74,9 @@ class PatrolCheckpoint:
             hitl_decisions=data.get("hitl_decisions"),
             action_result=data.get("action_result"),
             error=data.get("error"),
+            exception_log=data.get("exception_log", []),
+            exception_review=data.get("exception_review", []),
+            exception_hitl_decisions=data.get("exception_hitl_decisions"),
             created_at=data.get("created_at", 0.0),
             updated_at=data.get("updated_at", 0.0),
         )

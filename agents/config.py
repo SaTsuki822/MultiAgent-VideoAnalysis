@@ -63,6 +63,10 @@ class Settings:
     autoscaler_poll_interval_sec: float = 5.0  # 采样间隔（秒）
     autoscaler_cooldown_sec: float = 10.0      # 扩缩容冷却窗口（秒，防抖）
 
+    # ---- 异常处理 LLM 顾问（Phase 2）----
+    exception_llm_advisor_enabled: bool = False   # 是否启用 LLM 异常顾问
+    exception_llm_advisor_threshold: float = 0.7  # LLM 建议置信度阈值，低于此值 fallback 到 L1
+
     # ---- 路径 ----
     data_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data")
 

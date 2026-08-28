@@ -106,6 +106,81 @@ def _parse_search_sop_action(action_str: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def _make_fingerprint(action: str, observation: dict) -> str:
+    """生成工具调用的指纹，用于死循环检测。
+
+    指纹由查询词 + Observation 前 120 字符组成。
+    同样的查询拿到同样的返回 → 连续重复即判定死循环。
+    """
+    obs_text = json.dumps(observation, ensure_ascii=False)[:120]
+    return f"{action}|{obs_text}"
+
+
+def _detect_loop(fingerprints: list[str]) -> bool:
+    """检测最后两次调用是否完全相同（死循环）。"""
+    if len(fingerprints) < 2:
+        return False
+    return fingerprints[-1] == fingerprints[-2]
+
+
+def _compress_text_history(history: list[dict]) -> list[dict]:
+    """对文本 ReAct 的 history 做轻量压缩：保留最后一条完整，前面的做摘要。
+
+    压缩策略：
+    - thought 截断到 80 字符
+    - observation 只保留标题列表或错误摘要
+    """
+    if len(history) <= 1:
+        return history
+    compressed = []
+    for i, h in enumerate(history[:-1]):
+        obs = h["observation"]
+        if isinstance(obs, dict):
+            if "results" in obs:
+                titles = [r.get("title", "") for r in obs["results"][:2]]
+                obs_summary = f"查到: {', '.join(titles) or '无结果'}"
+            elif "error" in obs:
+                obs_summary = f"失败: {obs['error']}"
+            else:
+                obs_summary = str(obs)[:80]
+        else:
+            obs_summary = str(obs)[:80]
+        compressed.append({
+            "thought": f"[Step{i+1}] {h['thought'][:80]}...",
+            "action": h["action"],
+            "observation": obs_summary,
+        })
+    compressed.append(history[-1])
+    return compressed
+
+
+def _compress_fc_messages(messages: list[dict]) -> list[dict]:
+    """对 Function Calling 的消息列表做压缩：把早期的 assistant/tool 轮次摘要成一条。"""
+    if len(messages) <= 4:
+        return messages
+    compressed = [messages[0], messages[1]]  # 保留 system + user
+    # 遍历中间的 assistant/tool 对，做摘要
+    i = 2
+    while i < len(messages) - 2:
+        if messages[i].get("role") == "assistant" and i + 1 < len(messages) and messages[i + 1].get("role") == "tool":
+            tool_calls = messages[i].get("tool_calls", [])
+            if tool_calls:
+                fn = tool_calls[0]["function"]
+                args = json.loads(fn["arguments"])
+                query = args.get("query", "")[:40]
+                result = messages[i + 1].get("content", "")[:80]
+                compressed.append({
+                    "role": "assistant",
+                    "content": f"[历史步骤] 调用 {fn['name']}('{query}') → {result}",
+                })
+            i += 2
+        else:
+            compressed.append(messages[i])
+            i += 1
+    compressed.extend(messages[-2:])  # 保留最后两条完整
+    return compressed
+
+
 def _apply_final(rule: Rule, final: dict) -> Rule:
     """把编译结果 dict 写回 rule；字段类型不对则回退确定性编译。"""
     try:
@@ -135,12 +210,16 @@ def _react_compile_text(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_steps:
     """文本 ReAct 编译：模型输出 Thought/Action 文本，代码解析并执行 search_sop。
 
     循环：Thought → Action(search_sop) → Observation → ...
-    超步或解析失败则回退到 _deterministic_compile。
+    超步、解析失败、死循环检测触发则回退到 _deterministic_compile。
     """
     history: list[dict] = []
+    fingerprints: list[str] = []
 
     for step in range(max_steps):
-        prompt = _build_react_prompt(rule, history)
+        # ---- 上下文压缩：第 2 步起对早期 history 做摘要，防止 prompt 膨胀 ----
+        active_history = _compress_text_history(history) if step >= 1 else history
+
+        prompt = _build_react_prompt(rule, active_history)
         try:
             raw = llm.complete(
                 system="你是巡检规则编译助手。严格按 Thought/Action/Final Answer 格式输出。",
@@ -173,9 +252,16 @@ def _react_compile_text(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_steps:
         except Exception:
             observation = {"error": "SOP 查询失败"}
 
+        # ---- 死循环检测：记录指纹，连续重复则中断 ----
+        fingerprint = _make_fingerprint(action, observation)
+        fingerprints.append(fingerprint)
+        if _detect_loop(fingerprints):
+            # 检测到死循环（连续两次相同查询+相同返回），立即退出 ReAct
+            break
+
         history.append({"thought": thought, "action": action, "observation": observation})
 
-    # 超步或中间失败 → 回退确定性编译
+    # 超步、中间失败或死循环 → 回退确定性编译
     return _deterministic_compile(rule)
 
 
@@ -216,9 +302,13 @@ def _execute_tool_call(tool_call: ToolCall, toolbox: Toolbox):
 def _react_compile_with_tools(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_steps: int = 3) -> Rule:
     """原生 Function Calling 编译：模型直接输出 search_sop 的 tool_call，框架执行后喂回结果。
 
-    与 _react_compile_text 的区别：不再用文本解析 "Action: search_sop(...)"，
+    与 _react_compile_text 的区别：不再用文本解析 "Action: search_sop(...)",
     而是模型原生输出 tool_calls；多轮循环按 OpenAI 协议组织
     （assistant.tool_calls → tool 角色结果 → 下一轮）。
+
+    本实现已集成：
+    - 死循环检测：同样的查询+返回连续重复 2 次即中断
+    - 上下文压缩：第 2 步起对早期消息做摘要，防止上下文膨胀
     """
     # 从 MCP tools/list 拉取 search_sop 的 schema，转成 OpenAI tools 格式
     tools = mcp_tools_to_openai(toolbox.list_tools())
@@ -226,10 +316,14 @@ def _react_compile_with_tools(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_
         {"role": "system", "content": "你是巡检规则编译助手。可调用 search_sop 查询 SOP，最终输出结构化判定依据。"},
         {"role": "user", "content": _build_fc_user_prompt(rule)},
     ]
+    fingerprints: list[str] = []
 
-    for _step in range(max_steps):
+    for step in range(max_steps):
+        # ---- 上下文压缩：第 2 步起对早期 messages 做摘要 ----
+        active_messages = _compress_fc_messages(messages) if step >= 1 else messages
+
         try:
-            resp = llm.complete_with_tools(messages, tools)
+            resp = llm.complete_with_tools(active_messages, tools)
         except Exception:
             return _deterministic_compile(rule)
 
@@ -246,7 +340,17 @@ def _react_compile_with_tools(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_
             observation = _execute_tool_call(tc, toolbox)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(observation, ensure_ascii=False)})
 
+            # ---- 死循环检测：只针对 search_sop 生成指纹 ----
+            if tc.name == "search_sop":
+                action_repr = f"search_sop({tc.arguments.get('query', '')})"
+                fingerprint = _make_fingerprint(action_repr, observation)
+                fingerprints.append(fingerprint)
+                if _detect_loop(fingerprints):
+                    # 检测到死循环，直接回退确定性编译
+                    return _deterministic_compile(rule)
+
     return _deterministic_compile(rule)
+
 
 
 def _react_compile(rule: Rule, llm: LLMClient, toolbox: Toolbox, max_steps: int = 3) -> Rule:

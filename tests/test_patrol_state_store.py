@@ -62,7 +62,7 @@ def test_checkpoint_roundtrip():
 def test_run_patrol_persists_stages(monkeypatch):
     orch, store = make_orchestrator()
 
-    def fake_call_sync(url, task, payload):
+    def fake_call_sync_with_retry(cp, url, task, payload, source_agent="", max_retries=2):
         if task == "plan":
             return {"status": "success", "result": {"tasks": [{"id": "t1", "camera_id": "c1", "rule": {}}]}}
         if task == "verify":
@@ -74,7 +74,7 @@ def test_run_patrol_persists_stages(monkeypatch):
     def fake_dispatch(tasks):
         return [SimpleNamespace(status="success", result={"findings": [{"id": "f1", "hit": True}]})]
 
-    monkeypatch.setattr(orch, "_call_sync", fake_call_sync)
+    monkeypatch.setattr(orch, "_call_sync_with_retry", fake_call_sync_with_retry)
     monkeypatch.setattr(orch, "dispatch_to_perception", fake_dispatch)
 
     result = orch.run_patrol([{"id": "r1"}], [{"id": "cam1"}])
@@ -102,14 +102,14 @@ def test_resume_patrol_from_mid_checkpoint(monkeypatch):
     )
     store.save(cp)
 
-    def fake_call_sync(url, task, payload):
+    def fake_call_sync_with_retry(cp, url, task, payload, source_agent="", max_retries=2):
         if task == "verify":
             return {"status": "success", "result": {"alarms": [{"id": "a1"}]}}
         if task == "execute":
             return {"status": "success", "result": {"report": "ok"}}
         return {"status": "error", "error": "unknown"}
 
-    monkeypatch.setattr(orch, "_call_sync", fake_call_sync)
+    monkeypatch.setattr(orch, "_call_sync_with_retry", fake_call_sync_with_retry)
 
     result = orch.resume_patrol("patrol_x")
     assert result["status"] == "success"

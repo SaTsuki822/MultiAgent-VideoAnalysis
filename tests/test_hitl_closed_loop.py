@@ -37,7 +37,7 @@ def make_orchestrator():
 def _plan_verify_fakes(verify_result, execute_capture):
     """构造 plan→verify→execute 的假 HTTP 调用；execute 的参数会被写入 execute_capture。"""
 
-    def fake_call_sync(url, task, payload):
+    def fake_call_sync_with_retry(cp, url, task, payload, source_agent="", max_retries=2):
         if task == "plan":
             return {"status": "success", "result": {"tasks": [{"id": "t1", "camera_id": "c1", "rule": {}}]}}
         if task == "verify":
@@ -47,7 +47,7 @@ def _plan_verify_fakes(verify_result, execute_capture):
             return {"status": "success", "result": {"report": "ok"}}
         return {"status": "error", "error": "unknown"}
 
-    return fake_call_sync
+    return fake_call_sync_with_retry
 
 
 def _fake_dispatch(tasks):
@@ -65,7 +65,7 @@ def test_run_patrol_stops_at_hitl(monkeypatch):
         "pending_review": [{"id": "a1", "severity": "low"}],
     }
 
-    monkeypatch.setattr(orch, "_call_sync", _plan_verify_fakes(verify_result, execute_capture))
+    monkeypatch.setattr(orch, "_call_sync_with_retry", _plan_verify_fakes(verify_result, execute_capture))
     monkeypatch.setattr(orch, "dispatch_to_perception", _fake_dispatch)
 
     result = orch.run_patrol([{"id": "r1"}], [{"id": "cam1"}])
@@ -95,13 +95,13 @@ def test_submit_hitl_decisions_continues_to_done(monkeypatch):
 
     execute_capture = {}
 
-    def fake_call_sync(url, task, payload):
+    def fake_call_sync_with_retry(cp, url, task, payload, source_agent="", max_retries=2):
         if task == "execute":
             execute_capture["payload"] = payload
             return {"status": "success", "result": {"report": "ok"}}
         return {"status": "error", "error": "unknown"}
 
-    monkeypatch.setattr(orch, "_call_sync", fake_call_sync)
+    monkeypatch.setattr(orch, "_call_sync_with_retry", fake_call_sync_with_retry)
 
     decisions = [{"alarm_id": "a1", "decision": "confirm"}]
     result = orch.submit_hitl_decisions("patrol_x", decisions)
@@ -128,12 +128,12 @@ def test_submit_hitl_decisions_empty_list_still_proceeds(monkeypatch):
     )
     store.save(cp)
 
-    def fake_call_sync(url, task, payload):
+    def fake_call_sync_with_retry(cp, url, task, payload, source_agent="", max_retries=2):
         if task == "execute":
             return {"status": "success", "result": {"report": "ok"}}
         return {"status": "error", "error": "unknown"}
 
-    monkeypatch.setattr(orch, "_call_sync", fake_call_sync)
+    monkeypatch.setattr(orch, "_call_sync_with_retry", fake_call_sync_with_retry)
 
     result = orch.submit_hitl_decisions("patrol_x", [])
     assert result["status"] == "success"
@@ -145,7 +145,7 @@ def test_no_pending_review_skips_hitl(monkeypatch):
     execute_capture = {}
     verify_result = {"alarms": [{"id": "a1", "severity": "high"}], "pending_review": []}
 
-    monkeypatch.setattr(orch, "_call_sync", _plan_verify_fakes(verify_result, execute_capture))
+    monkeypatch.setattr(orch, "_call_sync_with_retry", _plan_verify_fakes(verify_result, execute_capture))
     monkeypatch.setattr(orch, "dispatch_to_perception", _fake_dispatch)
 
     result = orch.run_patrol([{"id": "r1"}], [{"id": "cam1"}])
